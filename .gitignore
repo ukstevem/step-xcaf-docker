@@ -1,0 +1,5 @@
+﻿out/
+in/
+__pycache__/
+*.pyc
+.vscode/

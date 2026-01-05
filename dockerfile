@@ -13,5 +13,8 @@ COPY read_step_xcaf.py /app/read_step_xcaf.py
 COPY export_stl_xcaf.py /app/export_stl_xcaf.py
 COPY render_thumbnails.py /app/render_thumbnails.py
 COPY build_bom_from_xcaf.py /app/build_bom_from_xcaf.py
+COPY add_chirality_to_manifest.py /app/add_chirality_to_manifest.py
+COPY build_ui_bundle.py /app/build_ui_bundle.py
+
 
 ENTRYPOINT ["python"]

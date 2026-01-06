@@ -220,6 +220,16 @@ def main(out_dir: str) -> int:
         },
     }
 
+    ancillary_groups = None
+    ag_path = out_dir / "ancillary_groups.json"
+    if ag_path.exists():
+        try:
+            ancillary_groups = _read_json(ag_path)
+        except Exception:
+            ancillary_groups = None
+
+    bundle["grouping"]["ancillaries"] = ancillary_groups
+
     out_json = outp / "ui_bundle.json"
     out_json.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 

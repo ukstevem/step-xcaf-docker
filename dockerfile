@@ -15,6 +15,9 @@ COPY render_thumbnails.py /app/render_thumbnails.py
 COPY build_bom_from_xcaf.py /app/build_bom_from_xcaf.py
 COPY add_chirality_to_manifest.py /app/add_chirality_to_manifest.py
 COPY build_ui_bundle.py /app/build_ui_bundle.py
+COPY group_ancillaries.py /app/group_ancillaries.py
+COPY build_grouped_ancillaries_summary.py /app/build_grouped_ancillaries_summary.py
+
 
 
 ENTRYPOINT ["python"]

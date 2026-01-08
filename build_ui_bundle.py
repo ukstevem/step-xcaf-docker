@@ -162,12 +162,12 @@ def _enrich_leaf_bom(
 
 
 def main(out_dir: str) -> int:
-    outp = Path(out_dir)
+    out_dir = Path(out_dir)
 
-    xcaf_path = outp / "xcaf_instances.json"
-    manifest_path = outp / "stl_manifest.json"
-    leaf_csv = outp / "bom_from_xcaf_leaf.csv"
-    all_csv = outp / "bom_from_xcaf_all.csv"
+    xcaf_path = out_dir / "xcaf_instances.json"
+    manifest_path = out_dir / "stl_manifest.json"
+    leaf_csv = out_dir / "bom_from_xcaf_leaf.csv"
+    all_csv = out_dir / "bom_from_xcaf_all.csv"
 
     if not xcaf_path.exists():
         print(f"Missing: {xcaf_path}", flush=True)
@@ -220,7 +220,7 @@ def main(out_dir: str) -> int:
         },
     }
 
-    out_json = outp / "ui_bundle.json"
+    out_json = out_dir / "ui_bundle.json"
     out_json.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 
     c = bundle["meta"]["counts"]

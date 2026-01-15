@@ -1,0 +1,15 @@
+.git
+**/.git
+out
+in
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.stl
+*.glb
+*.png
+*.jpg
+*.jpeg
+*.zip
+*.7z

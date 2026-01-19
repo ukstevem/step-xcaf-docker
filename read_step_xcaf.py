@@ -9,6 +9,7 @@ Creates /out/xcaf_instances.json capturing:
   - local + global transforms
   - basic per-definition shape facts (shape_kind, solid_count, bbox) FOR PARTS
   - stable per-definition signatures (def_sig/def_sig_free) via shared brep_signature.py
+  - optional per-definition massprops (volume/area + mass_kg using DEFAULT_DENSITY_KG_M3)
   - fast indexes (children_by_parent_def, children_by_parent_occ, occs_by_ref_def, leaf_occ_ids)
 
 No STL/PNG generation happens here.
@@ -59,6 +60,7 @@ def _load_dotenv(path: Path, *, override: bool = False) -> Dict[str, str]:
     """Load KEY=VALUE pairs from a .env file into os.environ.
 
     - If override=False, existing os.environ values are preserved.
+      (docker --env-file should win)
     - Returns dict of keys actually set (after applying override rule).
     """
     if not path.exists() or not path.is_file():
@@ -102,6 +104,11 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_str(name: str, default: str) -> str:
+    s = os.environ.get(name, "").strip()
+    return s if s else default
+
+
 # -----------------------------------------------------------------------------
 # Deterministic bbox quantization (must match Step 2 when used)
 # -----------------------------------------------------------------------------
@@ -124,13 +131,17 @@ def _mod(name: str):
     return __import__(f"OCP.{name}", fromlist=[name])
 
 
-def call_maybe_s(obj: Any, method: str, *args):
+def call_maybe_s(obj, method: str, *args):
     """
-    Try obj.method(*args) then obj.method_s(*args) for OCP binding variants.
+    Call obj.method(*args) or obj.method_s(*args) for OCP binding variants.
 
-    Important: if obj.method exists but raises TypeError due to SWIG signature
-    mismatch, fall back to method_s.
+    Also handles the common OCP pattern where `obj` is a module and the real
+    callable lives on an inner class wrapper with the same name as the module,
+    e.g.:
+        OCP.BRepGProp.BRepGProp.VolumeProperties
+        OCP.BRepBndLib.BRepBndLib.Add
     """
+    # 1) try directly on obj
     fn = getattr(obj, method, None)
     if callable(fn):
         try:
@@ -142,8 +153,23 @@ def call_maybe_s(obj: Any, method: str, *args):
     if callable(fn_s):
         return fn_s(*args)
 
-    raise AttributeError(f"{type(obj).__name__} has no usable {method} / {method}_s")
+    # 2) if obj looks like a module, try class wrapper named after module tail
+    mod_name = getattr(obj, "__name__", "")
+    tail = mod_name.split(".")[-1] if mod_name else ""
+    if tail:
+        wrapper = getattr(obj, tail, None)
+        if wrapper is not None:
+            fn = getattr(wrapper, method, None)
+            if callable(fn):
+                try:
+                    return fn(*args)
+                except TypeError:
+                    pass
+            fn_s = getattr(wrapper, method + "_s", None)
+            if callable(fn_s):
+                return fn_s(*args)
 
+    raise AttributeError(f"{type(obj).__name__} has no usable {method} / {method}_s")
 
 def _to_py_str(x) -> str:
     for m in ("ToExtString", "ToCString", "PrintToString"):
@@ -364,30 +390,44 @@ def _shape_bbox(shape, *, tol_mm: float) -> Optional[Dict[str, List[float]]]:
     return {"min": mn, "max": mx, "size": sz}
 
 
+def _volume_mm3_to_mass_kg(volume_mm3: float, density_kg_m3: float) -> float:
+    # mm^3 -> m^3 is 1e-9
+    return float(volume_mm3) * 1e-9 * float(density_kg_m3)
+
 
 def _shape_massprops(shape) -> Optional[Dict[str, float]]:
-    """Best-effort mass props (NOT used for def_sig). Kept for optional reporting only."""
+    """Best-effort volume/area (mm^3 / mm^2). Not used for def_sig."""
     if shape is None or shape.IsNull():
         return None
 
-    try:
-        GProp = _mod("GProp")
-        BRepGProp = _mod("BRepGProp")
+    GProp = _mod("GProp")
+    BRepGProp = _mod("BRepGProp")
 
-        props_v = GProp.GProp_GProps()
-        props_s = GProp.GProp_GProps()
+    props_v = GProp.GProp_GProps()
+    props_s = GProp.GProp_GProps()
 
-        # OCP binding variants: VolumeProperties vs VolumeProperties_s
-        call_maybe_s(BRepGProp, "VolumeProperties", shape, props_v)
-        call_maybe_s(BRepGProp, "SurfaceProperties", shape, props_s)
+    # Try module-level then class-wrapper, each with _s fallback via call_maybe_s
+    cands = [BRepGProp]
+    cls = getattr(BRepGProp, "BRepGProp", None)
+    if cls is not None:
+        cands.append(cls)
 
-        vol = float(props_v.Mass())
-        area = float(props_s.Mass())
+    last_err = None
+    for obj in cands:
+        try:
+            call_maybe_s(obj, "VolumeProperties", shape, props_v)
+            call_maybe_s(obj, "SurfaceProperties", shape, props_s)
+            vol = float(props_v.Mass())
+            area = float(props_s.Mass())
+            return {"volume": vol, "area": area}
+        except Exception as e:
+            last_err = e
 
-        # Guard: sometimes you get zeros for weird shapes
-        return {"volume": vol, "area": area}
-    except Exception:
-        return None
+    if _env_int("MASSPROPS_DEBUG", 0) == 1 and last_err is not None:
+        print(f"[MASSPROPS_DEBUG] failed: {type(last_err).__name__}: {last_err}", flush=True)
+
+    return None
+
 
 # -----------------------------------------------------------------------------
 # Transform helpers
@@ -421,6 +461,7 @@ def _as_trsf(x):
 
     return gp.gp_Trsf()
 
+
 def _trsf_mul(a, b):
     """Multiply two transforms (gp_Trsf or TopLoc_Location)."""
     a_t = _as_trsf(a)
@@ -436,7 +477,7 @@ def _trsf_mul(a, b):
 
 def _trsf_to_4x4(trsf) -> List[float]:
     """Convert gp_Trsf or TopLoc_Location to row-major 4x4 list."""
-    t = _as_trsf(trsf)  # <-- CRITICAL: normalize TopLoc_Location -> gp_Trsf
+    t = _as_trsf(trsf)
     m = t.VectorialPart()
     tr = t.TranslationPart()
     tx, ty, tz = float(tr.X()), float(tr.Y()), float(tr.Z())
@@ -446,6 +487,7 @@ def _trsf_to_4x4(trsf) -> List[float]:
         float(m.Value(3, 1)), float(m.Value(3, 2)), float(m.Value(3, 3)), tz,
         0.0, 0.0, 0.0, 1.0,
     ]
+
 
 def _sorted_labels_from_seq(seq) -> List[Any]:
     """Return labels from a TDF_LabelSequence in deterministic order."""
@@ -502,19 +544,19 @@ def build_xcaf_instances_json(
         if dotenv_used:
             dotenv_sources.append(str(p))
     else:
-        # Common locations in your docker run:
-        # - working dir: /app
-        # - repo root: /app
         for p in (Path("/app/.env"), Path(".env")):
             used = _load_dotenv(p, override=False)
             if used:
                 dotenv_sources.append(str(p))
                 dotenv_used.update(used)
 
-    # Read shared settings (Step 1 + Step 2 must match)
+    # Shared settings (Step 1 + Step 2 must match where relevant)
     bbox_tol_mm = _env_float("BBOX_TOL_MM", 0.0)
     use_sig_free = _env_int("USE_SIG_FREE", 1)
     skip_chirality = _env_int("SKIP_CHIRALITY", 1)
+
+    # Mass settings
+    density_kg_m3 = _env_float("DEFAULT_DENSITY_KG_M3", 7850.0)
 
     analysis_started_utc = datetime.now(timezone.utc)
     t0 = time.perf_counter()
@@ -573,8 +615,12 @@ def build_xcaf_instances_json(
             shape_kind = _shape_kind(shp)
             solid_count = _solid_count(shp) if has_shape else 0
             bbox = _shape_bbox(shp, tol_mm=bbox_tol_mm) if has_shape else None
+
             if with_massprops and has_shape:
                 mp = _shape_massprops(shp)
+                if mp is not None:
+                    mp["density_kg_m3"] = float(density_kg_m3)
+                    mp["mass_kg"] = _volume_mm3_to_mass_kg(mp["volume"], density_kg_m3)
 
         # Stable B-Rep signature (shared module; Step 2 must compute identically).
         def_sig = None
@@ -714,7 +760,6 @@ def build_xcaf_instances_json(
                     )
 
                 # GetLocation returns TopLoc_Location in OCP.
-                # Keep it as-is; _as_trsf handles conversion.
                 try:
                     local_loc = call_maybe_s(st, "GetLocation", child_occ)
                     local_trsf = local_loc
@@ -811,8 +856,7 @@ def build_xcaf_instances_json(
                 "is_leaf": False,
             }
             children_by_parent_def.setdefault(root_def_id, []).append(occ_id)
-            # NOTE: legacy behaviour retained for compatibility:
-            children_by_parent_occ.setdefault(root_def_id, []).append(occ_id)
+            children_by_parent_occ.setdefault(root_def_id, []).append(occ_id)  # legacy
             occs_by_ref_def.setdefault(real_root_def_id, []).append(occ_id)
 
             expand_definition(
@@ -840,7 +884,7 @@ def build_xcaf_instances_json(
             if occurrences.get(oid, {}).get("parent_def") != parent_def:
                 warnings.append({"type": "children_index_mismatch", "parent_def": parent_def, "occ_id": oid})
 
-    # --- Signature collision check ---------------------------------------------
+    # --- Signature collision check ------------------------------------------
     signature_collisions: List[Dict[str, Any]] = []
     if with_signature:
         sig_map: Dict[str, List[str]] = {}
@@ -871,7 +915,7 @@ def build_xcaf_instances_json(
     analysis_finished_utc = datetime.now(timezone.utc)
     runtime_s = time.perf_counter() - t0
 
-    # --- Deterministic ordering for JSON output -------------------------------
+    # --- Deterministic ordering for JSON output -----------------------------
     for _k, _lst in children_by_parent_def.items():
         _lst.sort()
     for _k, _lst in children_by_parent_occ.items():
@@ -905,6 +949,9 @@ def build_xcaf_instances_json(
                 "BBOX_TOL_MM": float(bbox_tol_mm),
                 "USE_SIG_FREE": int(use_sig_free),
                 "SKIP_CHIRALITY": int(skip_chirality),
+                "WITH_MASSPROPS": int(with_massprops),
+                "DEFAULT_DENSITY_KG_M3": float(density_kg_m3),
+                "MASSPROPS_DEBUG": int(_env_int("MASSPROPS_DEBUG", 0)),
             },
         },
         "root_def": root_def_id,
@@ -926,7 +973,7 @@ def build_xcaf_instances_json(
     out_json = out_dir_p / "xcaf_instances.json"
     out_json.write_text(json.dumps(out, indent=2, sort_keys=True), encoding="utf-8")
 
-    # --- Synopsis -------------------------------------------------------------
+    # --- Synopsis -----------------------------------------------------------
     print("\n=== Step 1 Synopsis ===", flush=True)
     print(f"Analysis started : {analysis_started_utc.isoformat(timespec='seconds')}", flush=True)
     print(f"Analysis finished: {analysis_finished_utc.isoformat(timespec='seconds')}", flush=True)
@@ -951,7 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="STEP→XCAF→xcaf_instances.json (Step 1)")
     p.add_argument("step_path", help="Input STEP file (e.g. /in/model.step)")
     p.add_argument("out_dir", nargs="?", default="/out", help="Output dir (default: /out)")
-    p.add_argument("--with_massprops", action="store_true", help="Include volume/area (best-effort; not used for def_sig)")
+    p.add_argument("--with_massprops", action="store_true", help="Include volume/area + mass_kg (best-effort; not used for def_sig)")
 
     sig_group = p.add_mutually_exclusive_group()
     sig_group.add_argument("--with_signature", dest="with_signature", action="store_true", help="Compute def_sig for shaped definitions (default)")
@@ -964,6 +1011,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--env", dest="env_path", default="", help="Path to .env (default: /app/.env then ./.env)")
 
     ns = p.parse_args(argv)
+
+    # ---------------------------------------------------------------------
+    # Load .env EARLY so env-driven switches work (when not using --env-file).
+    # Do not override existing env (docker --env-file or shell should win).
+    # ---------------------------------------------------------------------
+    env_file = (ns.env_path.strip() or "")
+    if env_file:
+        _load_dotenv(Path(env_file), override=False)
+    else:
+        for pth in (Path("/app/.env"), Path(".env")):
+            _load_dotenv(pth, override=False)
 
     # Env default for massprops (CLI overrides env)
     env_massprops = _env_int("WITH_MASSPROPS", 0)

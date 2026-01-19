@@ -159,7 +159,7 @@ if (-not (Test-Path -LiteralPath $xcafJson)) {
   throw "Missing prerequisite: $xcafJson`nRun Step 1 first to produce xcaf_instances.json."
 }
 
-Write-Host "`n[Step 2 DEV] Export STLs + stl_manifest.json" -ForegroundColor Green
+Write-Host "`n[Step 2 DEV] Export STLs + assets_manifest.json" -ForegroundColor Green
 Write-Host "Repo mount: $repoAbs -> /app (live code)" -ForegroundColor Cyan
 if ($envFileAbs) { Write-Host ".env passed to container: $envFileAbs" -ForegroundColor Cyan }
 
@@ -197,7 +197,7 @@ if ($StrictSignatureCollisions) { $step2Args += "--strict-signature-collisions" 
 
 Run-Docker $step2Args
 
-$manifestJson = Join-Path $OutDir "stl_manifest.json"
+$manifestJson = Join-Path $OutDir "assets_manifest.json"
 if (-not (Test-Path -LiteralPath $manifestJson)) {
   throw "Missing output: $manifestJson"
 }
@@ -223,7 +223,7 @@ if (($stlsAvailable -le 0) -or ($itemsWithStlPath -le 0)) {
   Write-Host "Chirality step enabled: STLs available (exported=$exported skipped_existing=$skipped itemsWithStlPath=$itemsWithStlPath)." -ForegroundColor Cyan
 }
 
-Write-Host "`n[Step 3 DEV] Add chirality signatures to stl_manifest.json" -ForegroundColor Green
+Write-Host "`n[Step 3 DEV] Add chirality signatures to assets_manifest.json" -ForegroundColor Green
 
 if (-not $SkipChirality) {
   $step3Args = @(
@@ -242,7 +242,7 @@ if (-not $SkipChirality) {
     $ImageName,
     "/app/add_chirality_to_manifest.py",
     "--out-dir","/out",
-    "--manifest","/out/stl_manifest.json"
+    "--manifest","/out/assets_manifest.json"
   )
 
   Run-Docker $step3Args

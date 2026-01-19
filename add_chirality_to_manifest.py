@@ -1,55 +1,31 @@
 ﻿#!/usr/bin/env python3
 """
-add_chirality_to_manifest.py (Step 3)
+Step 3: add_chirality_to_manifest.py
 
-Reads:
-  - /out/stl_manifest.json
-  - /out/stl/*.stl
+Reads assets_manifest.json and adds chirality signatures for each item that has stl_path.
 
-Writes:
-  - updates /out/stl_manifest.json in-place:
-      adds sig_chiral, sig_free (and signature_meta)
+Outputs:
+  - updates /out/assets_manifest.json in-place
 
-Signature approach (mesh-based, deterministic):
-  1) Read STL vertices
-  2) Deterministic subsample if huge
-  3) Center at centroid
-  4) PCA -> eigenvectors sorted by eigenvalues desc
-  5) Make frame right-handed (det>0)
-  6) Fix axis signs deterministically using third moment along each axis
-  7) Transform vertices to PCA frame, quantize to tol (default 0.1mm), sort points, hash bytes
-  8) Mirror X in PCA frame and hash again => sig_free = min(sig, sig_mirror)
+Fields added per item:
+  - chirality_sig       : mirror-sensitive hash
+  - chirality_sig_free  : mirror-invariant hash (min over axis-flip variants)
+  - chirality_algo      : algorithm id string
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
 import hashlib
 import json
+import math
+import os
 import struct
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
-# numpy is required here (explicit)
-import numpy as np
+from typing import Any, Dict, Iterable, List, Tuple
 
 
-# ---------------------------
-# Constants / guards
-# ---------------------------
-
-SIG_TOL_MM = 0.1
-SIG_SCALE = int(round(1.0 / SIG_TOL_MM))  # 10
-MAX_VERTICES_USED = 200_000  # bounded for performance/determinism
-
-
-# ---------------------------
-# JSON helpers
-# ---------------------------
-
-def _utc_now_iso() -> str:
-    return _dt.datetime.now(tz=_dt.timezone.utc).isoformat(timespec="seconds")
+CHIRALITY_ALGO = "stl_features_v1_sha256"
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -60,6 +36,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _write_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
@@ -67,40 +44,61 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-# ---------------------------
-# STL parsing (binary + ASCII)
-# ---------------------------
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-def _is_probably_binary_stl(buf: bytes) -> bool:
-    # Heuristic: binary STL has 84+ bytes and an uint32 triangle count consistent with length
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _quant(v: float, tol: float) -> int:
+    return int(round(float(v) / tol))
+
+
+def _tri_area(ax, ay, az, bx, by, bz, cx, cy, cz) -> float:
+    abx, aby, abz = (bx - ax), (by - ay), (bz - az)
+    acx, acy, acz = (cx - ax), (cy - ay), (cz - az)
+    cxp = aby * acz - abz * acy
+    cyp = abz * acx - abx * acz
+    czp = abx * acy - aby * acx
+    return 0.5 * math.sqrt(cxp * cxp + cyp * cyp + czp * czp)
+
+
+def _is_binary_stl(buf: bytes) -> bool:
     if len(buf) < 84:
         return False
-    tri = struct.unpack_from("<I", buf, 80)[0]
-    expected = 84 + tri * 50
+    # binary STL: 80 header + uint32 tri count + 50 bytes per tri
+    tri_count = struct.unpack("<I", buf[80:84])[0]
+    expected = 84 + (tri_count * 50)
     return expected == len(buf)
 
 
-def _read_stl_vertices(path: Path) -> np.ndarray:
-    data = path.read_bytes()
-    if _is_probably_binary_stl(data):
-        tri = struct.unpack_from("<I", data, 80)[0]
-        off = 84
-        verts: List[Tuple[float, float, float]] = []
-        # Each tri record: normal(12) + v1(12) + v2(12) + v3(12) + attr(2)
-        for _ in range(tri):
-            # skip normal
-            off += 12
-            v1 = struct.unpack_from("<fff", data, off); off += 12
-            v2 = struct.unpack_from("<fff", data, off); off += 12
-            v3 = struct.unpack_from("<fff", data, off); off += 12
-            off += 2  # attribute
-            verts.append(v1); verts.append(v2); verts.append(v3)
-        return np.asarray(verts, dtype=np.float64)
+def _iter_triangles_from_binary_stl(buf: bytes) -> Iterable[Tuple[float, ...]]:
+    tri_count = struct.unpack("<I", buf[80:84])[0]
+    off = 84
+    for _ in range(tri_count):
+        # normal (3f) + 3 vertices (9f) + attr (uint16)
+        rec = buf[off : off + 50]
+        off += 50
+        vals = struct.unpack("<12fH", rec)
+        # ignore normal vals[0:3], use vertices
+        ax, ay, az = vals[3], vals[4], vals[5]
+        bx, by, bz = vals[6], vals[7], vals[8]
+        cx, cy, cz = vals[9], vals[10], vals[11]
+        yield (ax, ay, az, bx, by, bz, cx, cy, cz)
 
-    # ASCII fallback
-    txt = data.decode("utf-8", errors="ignore").splitlines()
-    verts2: List[Tuple[float, float, float]] = []
-    for line in txt:
+
+def _iter_triangles_from_ascii_stl(text: str) -> Iterable[Tuple[float, ...]]:
+    # Basic ASCII STL parser: look for "vertex x y z"
+    verts: List[Tuple[float, float, float]] = []
+    for line in text.splitlines():
         s = line.strip()
         if not s.lower().startswith("vertex "):
             continue
@@ -108,160 +106,194 @@ def _read_stl_vertices(path: Path) -> np.ndarray:
         if len(parts) != 4:
             continue
         try:
-            verts2.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            x = float(parts[1]); y = float(parts[2]); z = float(parts[3])
         except Exception:
             continue
-    if not verts2:
-        raise RuntimeError(f"Failed to parse STL (no vertices): {path}")
-    return np.asarray(verts2, dtype=np.float64)
+        verts.append((x, y, z))
+        if len(verts) == 3:
+            (ax, ay, az), (bx, by, bz), (cx, cy, cz) = verts
+            verts = []
+            yield (ax, ay, az, bx, by, bz, cx, cy, cz)
 
 
-# ---------------------------
-# Deterministic signature
-# ---------------------------
-
-def _subsample_vertices(V: np.ndarray, max_n: int) -> np.ndarray:
-    n = int(V.shape[0])
-    if n <= max_n:
-        return V
-    stride = (n // max_n) + 1
-    return V[::stride].copy()
-
-
-def _pca_frame(X: np.ndarray) -> np.ndarray:
-    # X: Nx3 centered
-    # covariance
-    n = float(X.shape[0])
-    C = (X.T @ X) / max(n, 1.0)
-    w, Q = np.linalg.eigh(C)  # eigenvalues asc
-    idx = np.argsort(w)[::-1]
-    Q = Q[:, idx]  # columns are principal axes
-
-    # enforce right-handed
-    if np.linalg.det(Q) < 0.0:
-        Q[:, 2] *= -1.0
-
-    # deterministic sign fixing using 3rd moment along each axis
-    # (helps remove sign ambiguity and makes mirror detectable)
-    for i in range(3):
-        a = Q[:, i]
-        proj = X @ a
-        m3 = float(np.mean(proj ** 3))
-        if m3 < 0.0:
-            Q[:, i] *= -1.0
-
-    # re-enforce right-handed after sign flips
-    if np.linalg.det(Q) < 0.0:
-        Q[:, 2] *= -1.0
-
-    return Q
+def _load_triangles(stl_path: Path) -> List[Tuple[float, ...]]:
+    buf = stl_path.read_bytes()
+    if _is_binary_stl(buf):
+        return list(_iter_triangles_from_binary_stl(buf))
+    # fallback ascii
+    try:
+        text = buf.decode("utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    return list(_iter_triangles_from_ascii_stl(text))
 
 
-def _quantize_int(X: np.ndarray) -> np.ndarray:
-    # round to tol and scale to int
-    Qi = np.rint(X * SIG_SCALE).astype(np.int32)
-    return Qi
+def _bbox_of_tris(tris: List[Tuple[float, ...]]) -> Tuple[float, float, float, float, float, float]:
+    mnx = mny = mnz = float("inf")
+    mxx = mxy = mxz = float("-inf")
+    for t in tris:
+        ax, ay, az, bx, by, bz, cx, cy, cz = t
+        for x, y, z in ((ax, ay, az), (bx, by, bz), (cx, cy, cz)):
+            mnx = min(mnx, x); mny = min(mny, y); mnz = min(mnz, z)
+            mxx = max(mxx, x); mxy = max(mxy, y); mxz = max(mxz, z)
+    if not math.isfinite(mnx):
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return (mnx, mny, mnz, mxx, mxy, mxz)
 
 
-def _hash_points_int(Qi: np.ndarray) -> str:
-    # sort lexicographically for deterministic order
-    # (bounded by MAX_VERTICES_USED, so OK)
-    order = np.lexsort((Qi[:, 2], Qi[:, 1], Qi[:, 0]))
-    S = Qi[order]
+def _features_for_tris(tris: List[Tuple[float, ...]], tol_mm: float) -> Dict[str, Any]:
+    mnx, mny, mnz, mxx, mxy, mxz = _bbox_of_tris(tris)
+    dx, dy, dz = (mxx - mnx), (mxy - mny), (mxz - mnz)
 
-    h = hashlib.sha256()
-    # pack as little-endian int32 triples
-    for i in range(S.shape[0]):
-        h.update(struct.pack("<iii", int(S[i, 0]), int(S[i, 1]), int(S[i, 2])))
-    return h.hexdigest()
+    # area histogram (quantized)
+    areas_q: List[int] = []
+    for t in tris:
+        a = _tri_area(*t)
+        areas_q.append(_quant(a, tol_mm * tol_mm))
+    areas_q.sort()
 
+    # vertex cloud signature (order-independent)
+    vq: List[Tuple[int, int, int]] = []
+    for t in tris:
+        ax, ay, az, bx, by, bz, cx, cy, cz = t
+        vq.append((_quant(ax, tol_mm), _quant(ay, tol_mm), _quant(az, tol_mm)))
+        vq.append((_quant(bx, tol_mm), _quant(by, tol_mm), _quant(bz, tol_mm)))
+        vq.append((_quant(cx, tol_mm), _quant(cy, tol_mm), _quant(cz, tol_mm)))
+    vq.sort()
 
-def compute_sig_chiral_and_free(vertices_mm: np.ndarray) -> Tuple[str, str, Dict[str, Any]]:
-    if vertices_mm.ndim != 2 or vertices_mm.shape[1] != 3:
-        raise RuntimeError("vertices must be Nx3")
+    # compress vertex list deterministically (bounded)
+    # keep first/last N to avoid huge payloads while remaining stable
+    N = 2000
+    if len(vq) > (2 * N):
+        vq_keep = vq[:N] + vq[-N:]
+    else:
+        vq_keep = vq
 
-    V = _subsample_vertices(vertices_mm, MAX_VERTICES_USED)
-
-    # center
-    centroid = np.mean(V, axis=0)
-    X = V - centroid
-
-    # PCA frame
-    Q = _pca_frame(X)  # 3x3
-
-    # transform to PCA frame
-    Y = X @ Q  # Nx3
-
-    # chiral hash
-    Yi = _quantize_int(Y)
-    sig = _hash_points_int(Yi)
-
-    # mirror X in PCA frame
-    Y_m = Y.copy()
-    Y_m[:, 0] *= -1.0
-    Ymi = _quantize_int(Y_m)
-    sig_m = _hash_points_int(Ymi)
-
-    sig_free = min(sig, sig_m)
-
-    meta = {
-        "sig_tol_mm": SIG_TOL_MM,
-        "sig_scale": SIG_SCALE,
-        "vertices_in_file": int(vertices_mm.shape[0]),
-        "vertices_used": int(V.shape[0]),
-        "centroid_mm": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
-        "pca_det": float(np.linalg.det(Q)),
+    return {
+        "tri_count": len(tris),
+        "bbox_q": [
+            _quant(mnx, tol_mm), _quant(mny, tol_mm), _quant(mnz, tol_mm),
+            _quant(mxx, tol_mm), _quant(mxy, tol_mm), _quant(mxz, tol_mm),
+        ],
+        "ext_q": [_quant(dx, tol_mm), _quant(dy, tol_mm), _quant(dz, tol_mm)],
+        "areas_q_head": areas_q[:500],   # bounded
+        "areas_q_tail": areas_q[-500:] if len(areas_q) > 500 else [],
+        "verts_q_keep": vq_keep,
     }
-    return sig, sig_free, meta
 
 
-# ---------------------------
-# Main
-# ---------------------------
+def _hash_features(feat: Dict[str, Any]) -> str:
+    b = json.dumps(feat, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return _sha256_hex(b)
+
+
+def _apply_axis_flip(tris: List[Tuple[float, ...]], flipx: bool, flipy: bool, flipz: bool) -> List[Tuple[float, ...]]:
+    out: List[Tuple[float, ...]] = []
+    sx = -1.0 if flipx else 1.0
+    sy = -1.0 if flipy else 1.0
+    sz = -1.0 if flipz else 1.0
+    for t in tris:
+        ax, ay, az, bx, by, bz, cx, cy, cz = t
+        out.append((
+            ax * sx, ay * sy, az * sz,
+            bx * sx, by * sy, bz * sz,
+            cx * sx, cy * sy, cz * sz,
+        ))
+    return out
+
+
+def compute_chirality_sigs(stl_path: Path, tol_mm: float) -> Tuple[str, str]:
+    tris = _load_triangles(stl_path)
+    if not tris:
+        # empty -> stable but unique-ish
+        empty = _sha256_hex(b"empty-stl")
+        return empty, empty
+
+    # mirror-sensitive
+    feat = _features_for_tris(tris, tol_mm)
+    sig = _hash_features(feat)
+
+    # mirror-invariant across axis flips: pick minimum hash of variants
+    # (covers mirrored duplicates along any primary axis)
+    free_sigs: List[str] = []
+    for flipx, flipy, flipz in (
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ):
+        tris2 = _apply_axis_flip(tris, flipx, flipy, flipz)
+        feat2 = _features_for_tris(tris2, tol_mm)
+        free_sigs.append(_hash_features(feat2))
+    sig_free = min(free_sigs)
+
+    return sig, sig_free
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default="/out", help="Output dir (default: /out)")
-    ap.add_argument("--manifest", default="/out/stl_manifest.json", help="Manifest path")
+    ap.add_argument("--out-dir", default="/out")
+    ap.add_argument("--manifest", default="/out/assets_manifest.json")
     ns = ap.parse_args()
 
     out_dir = Path(ns.out_dir)
     manifest_path = Path(ns.manifest)
 
-    mani = _read_json(manifest_path)
-    items = mani.get("items", [])
+    m = _read_json(manifest_path)
+    items = m.get("items")
     if not isinstance(items, list):
-        raise RuntimeError("manifest missing 'items' list")
+        raise RuntimeError("assets_manifest.json missing items[]")
+
+    tol_mm = _env_float("CHIRALITY_TOL_MM", 0.05)
 
     updated = 0
-    for item in items:
-        if not isinstance(item, dict):
+    scanned = 0
+    for idx, it in enumerate(items, start=1):
+        if not isinstance(it, dict):
             continue
-        rel = item.get("stl_path")
-        if not rel:
+        stl_rel = it.get("stl_path")
+        if not (isinstance(stl_rel, str) and stl_rel.strip()):
             continue
 
-        stl_path = out_dir / str(rel)
+        # already done?
+        if isinstance(it.get("chirality_sig"), str) and it.get("chirality_sig"):
+            continue
+
+        stl_path = out_dir / stl_rel
         if not stl_path.exists():
-            raise FileNotFoundError(f"Missing STL referenced by manifest: {stl_path}")
+            it["chirality_sig"] = None
+            it["chirality_sig_free"] = None
+            it["chirality_algo"] = CHIRALITY_ALGO
+            it["chirality_error"] = f"missing_stl:{stl_rel}"
+            updated += 1
+            continue
 
-        V = _read_stl_vertices(stl_path)
-        sig_chiral, sig_free, meta = compute_sig_chiral_and_free(V)
-
-        item["sig_chiral"] = sig_chiral
-        item["sig_free"] = sig_free
-        item["signature_meta"] = meta
+        sig, sig_free = compute_chirality_sigs(stl_path, tol_mm)
+        it["chirality_sig"] = sig
+        it["chirality_sig_free"] = sig_free
+        it["chirality_algo"] = CHIRALITY_ALGO
         updated += 1
+        scanned += 1
 
-    # update manifest meta
-    meta0 = mani.get("meta", {})
-    if not isinstance(meta0, dict):
-        meta0 = {}
-    meta0["chirality_updated_utc"] = _utc_now_iso()
-    meta0["chirality_counts"] = {"items_updated": updated}
-    mani["meta"] = meta0
+        if (idx % 50) == 0:
+            print(f"[add_chirality_to_manifest] progress: {idx}/{len(items)} items scanned...")
 
-    _write_json(manifest_path, mani)
+    meta = m.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        m["meta"] = meta
+    meta["chirality"] = {
+        "algo": CHIRALITY_ALGO,
+        "tol_mm": float(tol_mm),
+        "updated_items": int(updated),
+        "scanned_stls": int(scanned),
+    }
+
+    _write_json(manifest_path, m)
     print(f"[add_chirality_to_manifest] updated items: {updated}")
     print(f"[add_chirality_to_manifest] wrote: {manifest_path}")
     return 0

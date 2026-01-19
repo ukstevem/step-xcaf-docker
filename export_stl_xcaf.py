@@ -10,7 +10,7 @@ Inputs:
 
 Outputs:
   - /out/stl/<part_id>.stl
-  - /out/stl_manifest.json
+  - /out/assets_manifest.json   (delta-only: mapping + statuses + settings)
 
 Identity rules:
   - def_id (XCAF label entry) is debug-only and NOT used for matching.
@@ -23,16 +23,16 @@ Collision rules:
       otherwise => mark ambiguous and skip export for those defs
   - If reread STEP yields multiple labels with the same signature:
       strict => fail
-      otherwise => mark ambiguous and skip export for those defs
+      otherwise => pick deterministically, and record reread_label_duplicates_for_sig
 
 Part-id rules (stable across Step 1 reruns):
   - part_index is always 0 for now.
-  - part_id = sha1(def_sig_used + "|" + part_index + "|" + bbox_q)
-  - bbox_q derived from Step 1 bbox (quantized) so IDs are stable.
+  - part_id = sha1(def_sig_used + "|" + part_index)
+    (No bbox dependency; the signature is the identity.)
 
 Manifest rule:
   - Only set stl_path when an STL was actually produced (or already exists + matched).
-    For unmatched/ambiguous items stl_path is null, so Step 3 can safely skip.
+    For unmatched/ambiguous items stl_path is null, so downstream steps can safely skip.
 """
 
 from __future__ import annotations
@@ -47,34 +47,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # -----------------------------
-# Env helpers (read from .env via docker --env-file)
-# -----------------------------
-def _env_str(name: str, default: str) -> str:
-    v = os.environ.get(name, "")
-    v = v.strip()
-    return v if v else default
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "")
-    raw = raw.strip()
-    if not raw:
-        return float(default)
-    try:
-        return float(raw)
-    except ValueError as e:
-        raise RuntimeError(f"Invalid env {name}='{raw}' (expected float)") from e
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "")
-    raw = raw.strip()
-    if not raw:
-        return int(default)
-    try:
-        return int(raw)
-    except ValueError as e:
-        raise RuntimeError(f"Invalid env {name}='{raw}' (expected int)") from e
-
-# -----------------------------
 # OCP imports (expected in docker)
 # -----------------------------
 _OCC_FLAVOR = "unknown"
@@ -82,8 +54,8 @@ try:
     from OCP.XCAFApp import XCAFApp_Application
     from OCP.TDocStd import TDocStd_Document
     from OCP.XCAFDoc import XCAFDoc_DocumentTool
-    from OCP.TCollection import TCollection_ExtendedString
-    from OCP.TDF import TDF_LabelSequence
+    from OCP.TCollection import TCollection_ExtendedString, TCollection_AsciiString
+    from OCP.TDF import TDF_LabelSequence, TDF_Tool
     from OCP.STEPCAFControl import STEPCAFControl_Reader
     from OCP.IFSelect import IFSelect_RetDone
     from OCP.Message import Message_ProgressRange
@@ -102,36 +74,25 @@ except Exception as e:
 # -----------------------------
 from brep_signature import DEF_SIG_ALGO, compute_def_sig, compute_def_sig_free
 
+
 # -----------------------------
-# Constants / guards (env-backed defaults)
+# Constants / guards
 # -----------------------------
-# Quantization tolerance for bbox_q (affects part_id stability)
-BBOX_TOL_MM = _env_float("STEP_BBOX_TOL_MM", 0.1)
-if BBOX_TOL_MM <= 0.0:
-    raise RuntimeError(f"STEP_BBOX_TOL_MM must be > 0, got {BBOX_TOL_MM}")
+DEFAULT_LINEAR_DEFLECTION = 0.25
+DEFAULT_ANGULAR_DEFLECTION = 0.35
 
-BBOX_SCALE = int(round(1.0 / BBOX_TOL_MM))
-if BBOX_SCALE <= 0:
-    raise RuntimeError(f"Invalid BBOX_SCALE from STEP_BBOX_TOL_MM={BBOX_TOL_MM}")
+MAX_SHAPED_DEFS_GUARD = 300000
+MAX_LABELS_GUARD = 600000
 
-# Meshing defaults (used unless CLI overrides)
-DEFAULT_LINEAR_DEFLECTION = _env_float("STEP2_LINEAR_DEFLECTION", 0.25)
-DEFAULT_ANGULAR_DEFLECTION = _env_float("STEP2_ANGULAR_DEFLECTION", 0.35)
+# progress cadence
+PROGRESS_LABEL_EVERY = 2000
+PROGRESS_DEF_EVERY = 200
 
-# Guards
-MAX_SHAPED_DEFS_GUARD = _env_int("STEP2_MAX_SHAPED_DEFS_GUARD", 300000)
-MAX_LABELS_GUARD = _env_int("STEP2_MAX_LABELS_GUARD", 600000)
 
 # -----------------------------
 # OCP binding helper
 # -----------------------------
 def call_maybe_s(obj: Any, method: str, *args):
-    """
-    Try obj.method(*args) then obj.method_s(*args) for OCP binding variants.
-
-    If obj.method exists but raises TypeError due to signature mismatch,
-    fall back to method_s.
-    """
     fn = getattr(obj, method, None)
     if callable(fn):
         try:
@@ -143,17 +104,20 @@ def call_maybe_s(obj: Any, method: str, *args):
         return fn_s(*args)
     raise AttributeError(f"{type(obj).__name__} has no usable {method} / {method}_s")
 
+
 # -----------------------------
 # Time / JSON helpers
 # -----------------------------
 def _utc_now_iso() -> str:
     return _dt.datetime.now(tz=_dt.timezone.utc).isoformat(timespec="seconds")
 
+
 def _read_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Missing JSON: {path}")
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,37 +127,10 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
         f.write("\n")
     tmp.replace(path)
 
-def _json_compact(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
 
 def _sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# -----------------------------
-# bbox quantization (from Step 1 bbox)
-# -----------------------------
-def _q_mm_to_int(v_mm: float) -> int:
-    return int(round(float(v_mm) * BBOX_SCALE))
-
-def _bbox_q_from_step1_def(defn: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    bb = defn.get("bbox")
-    if not isinstance(bb, dict):
-        return None
-    mn = bb.get("min")
-    mx = bb.get("max")
-    if not (isinstance(mn, list) and isinstance(mx, list) and len(mn) == 3 and len(mx) == 3):
-        return None
-    try:
-        mnf = [float(mn[0]), float(mn[1]), float(mn[2])]
-        mxf = [float(mx[0]), float(mx[1]), float(mx[2])]
-    except Exception:
-        return None
-    return {
-        "tol_mm": float(BBOX_TOL_MM),
-        "scale": int(BBOX_SCALE),
-        "min_i": [_q_mm_to_int(mnf[0]), _q_mm_to_int(mnf[1]), _q_mm_to_int(mnf[2])],
-        "max_i": [_q_mm_to_int(mxf[0]), _q_mm_to_int(mxf[1]), _q_mm_to_int(mxf[2])],
-    }
 
 # -----------------------------
 # XCAF document helpers
@@ -205,6 +142,7 @@ def _get_xcaf_app():
         return XCAFApp_Application.GetApplication_s()
     return XCAFApp_Application()
 
+
 def _construct_doc(fmt: str):
     try:
         return TDocStd_Document(fmt)
@@ -215,6 +153,7 @@ def _construct_doc(fmt: str):
     except Exception:
         pass
     return None
+
 
 def _new_xcaf_document():
     app = _get_xcaf_app()
@@ -237,17 +176,20 @@ def _new_xcaf_document():
             errs.append(f"doc.Main failed: {fmt}")
     raise RuntimeError("Failed to create XCAF document. " + "; ".join(errs))
 
+
 def _get_shape_tool(doc):
     try:
         return XCAFDoc_DocumentTool.ShapeTool(doc.Main())
     except Exception:
         return XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
 
+
 def _update_assemblies(shape_tool) -> None:
     try:
         call_maybe_s(shape_tool, "UpdateAssemblies")
     except Exception:
         return
+
 
 def _load_step_into_doc(step_path: Path, doc) -> None:
     if not step_path.exists():
@@ -268,10 +210,8 @@ def _load_step_into_doc(step_path: Path, doc) -> None:
     if not ok:
         raise RuntimeError("STEP transfer failed")
 
+
 def _get_all_shape_labels(shape_tool) -> List[Any]:
-    """
-    Prefer GetShapes(seq). If not present, fall back to GetFreeShapes(seq).
-    """
     seq = TDF_LabelSequence()
     try:
         call_maybe_s(shape_tool, "GetShapes", seq)
@@ -283,11 +223,8 @@ def _get_all_shape_labels(shape_tool) -> List[Any]:
         labs.append(seq.Value(i))
     return labs
 
+
 def _shape_from_label(shape_tool, lab) -> Optional[Any]:
-    """
-    Robust label -> TopoDS_Shape for OCP binding variants.
-    """
-    # 1) direct returning form
     try:
         shp = call_maybe_s(shape_tool, "GetShape", lab)
         if shp is not None and hasattr(shp, "IsNull") and not shp.IsNull():
@@ -295,7 +232,6 @@ def _shape_from_label(shape_tool, lab) -> Optional[Any]:
     except Exception:
         pass
 
-    # 2) out-arg form
     out_shp = TopoDS_Shape()
     try:
         _ = call_maybe_s(shape_tool, "GetShape", lab, out_shp)
@@ -304,7 +240,6 @@ def _shape_from_label(shape_tool, lab) -> Optional[Any]:
     except Exception:
         pass
 
-    # 3) alternate name
     try:
         shp = call_maybe_s(shape_tool, "Shape", lab)
         if shp is not None and hasattr(shp, "IsNull") and not shp.IsNull():
@@ -314,24 +249,24 @@ def _shape_from_label(shape_tool, lab) -> Optional[Any]:
 
     return None
 
-def _label_key(lab: Any) -> str:
-    """
-    Stable-ish key for a TDF_Label so we can pick a canonical label deterministically.
-    Prefer EntryDumpToString() (same style as Step 1 def_id).
-    """
-    try:
-        if hasattr(lab, "EntryDumpToString"):
-            s = lab.EntryDumpToString()
-            if isinstance(s, str) and s:
-                return s
-    except Exception:
-        pass
 
-    # Fallback: best-effort string form
+def _label_entry_str(lab) -> str:
+    """
+    Deterministic ordering key for labels: their "entry" string.
+    """
+    a = TCollection_AsciiString()
     try:
-        return str(lab)
+        call_maybe_s(TDF_Tool, "Entry", lab, a)
     except Exception:
-        return repr(lab)
+        # last resort: repr
+        return str(lab)
+    try:
+        return a.ToCString()
+    except Exception:
+        try:
+            return str(a)
+        except Exception:
+            return str(lab)
 
 
 # -----------------------------
@@ -346,6 +281,7 @@ def _mesh_shape(shape, linear_deflection: float, angular_deflection: float) -> N
         mesh = BRepMesh_IncrementalMesh(shape, float(linear_deflection))
         if hasattr(mesh, "Perform"):
             mesh.Perform()
+
 
 def _write_stl(shape, out_path: Path, ascii_mode: bool) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,6 +298,7 @@ def _write_stl(shape, out_path: Path, ascii_mode: bool) -> None:
         ok = False
     if not ok and not out_path.exists():
         raise RuntimeError(f"Failed to write STL: {out_path}")
+
 
 # -----------------------------
 # Main build
@@ -463,6 +400,7 @@ def build_manifest(
         )
 
     # Re-read STEP, enumerate labels, compute signature for each label shape
+    print(f"[export_stl_xcaf] Re-reading STEP: {step_path}")
     doc = _new_xcaf_document()
     _load_step_into_doc(step_path, doc)
     shape_tool = _get_shape_tool(doc)
@@ -472,14 +410,14 @@ def build_manifest(
     if len(labels) > MAX_LABELS_GUARD:
         raise RuntimeError(f"Guard: too many labels returned ({len(labels)} > {MAX_LABELS_GUARD})")
 
-    # Map signature -> canonical label (deterministic) and count of labels seen for that sig
-    sig_to_label: Dict[str, Any] = {}
-    sig_label_counts: Dict[str, int] = {}
-
+    sig_to_labels: Dict[str, List[Any]] = {}
     null_shapes = 0
     sig_fail = 0
 
-    for lab in labels:
+    for idx, lab in enumerate(labels, start=1):
+        if (idx % PROGRESS_LABEL_EVERY) == 0:
+            print(f"[export_stl_xcaf]  signature scan: {idx}/{len(labels)} labels...")
+
         shp = _shape_from_label(shape_tool, lab)
         if shp is None:
             null_shapes += 1
@@ -489,20 +427,11 @@ def build_manifest(
         except Exception:
             sig_fail += 1
             continue
+        sig_to_labels.setdefault(sig, []).append(lab)
 
-        sig_label_counts[sig] = sig_label_counts.get(sig, 0) + 1
-
-        # Pick a canonical label for this signature deterministically
-        if sig not in sig_to_label:
-            sig_to_label[sig] = lab
-        else:
-            # choose lowest label key
-            if _label_key(lab) < _label_key(sig_to_label[sig]):
-                sig_to_label[sig] = lab
-
-    reread_sig_dupe_count = sum(1 for k, v in sig_label_counts.items() if v > 1)
-    reread_sig_dupe_max = max([v for v in sig_label_counts.values() if v > 1], default=0)
-
+    # make label list ordering deterministic per signature
+    for s, labs in sig_to_labels.items():
+        labs.sort(key=_label_entry_str)
 
     # Export per Step1 def
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -516,8 +445,12 @@ def build_manifest(
     amb_reread = 0
     exported = 0
     skipped_existing = 0
+    matched_with_reread_dupes = 0
 
-    for def_id in shaped_def_ids:
+    for i, def_id in enumerate(shaped_def_ids, start=1):
+        if (i % PROGRESS_DEF_EVERY) == 0:
+            print(f"[export_stl_xcaf]  defs: {i}/{len(shaped_def_ids)}...")
+
         defn = defs[def_id]
 
         sig = defn.get("def_sig_free") if use_sig_free else None
@@ -526,26 +459,14 @@ def build_manifest(
             sig = defn.get("def_sig")
             sig_source = "def_sig"
 
-        bbox_q = _bbox_q_from_step1_def(defn)
-        if bbox_q is None:
-            raise RuntimeError(
-                f"Step 1 definition '{def_id}' has_shape=true but has no bbox; required for part_id stability."
-            )
-
         part_index = 0
-        pid_src = f"{sig}|{part_index}|{_json_compact(bbox_q)}"
-        part_id = _sha1_hex(pid_src)
+        part_id = _sha1_hex(f"{sig}|{part_index}")
 
         item: Dict[str, Any] = {
             "ref_def": def_id,
             "part_index": part_index,
             "part_id": part_id,
             "stl_path": None,
-            "bbox_q": bbox_q,
-            "name": defn.get("name"),
-            "shape_kind": defn.get("shape_kind"),
-            "solid_count": defn.get("solid_count"),
-            "qty_total": defn.get("qty_total"),
             "def_sig_algo": defn.get("def_sig_algo"),
             "def_sig_used": sig,
             "def_sig_source": sig_source,
@@ -565,25 +486,36 @@ def build_manifest(
             items.append(item)
             continue
 
-        lab = sig_to_label.get(sig)
-        if lab is None:
+        labs = sig_to_labels.get(sig, [])
+        if not labs:
             item["match_status"] = "unmatched_signature"
             unmatched += 1
             items.append(item)
             continue
 
-        # matched (even if there were multiple reread labels with same sig)
+        # reread duplicates
+        if len(labs) > 1:
+            item["reread_label_duplicates_for_sig"] = len(labs)
+            if strict:
+                item["match_status"] = "ambiguous_reread_multiple_labels"
+                item["ambiguous"] = True
+                item["ambiguous_label_count"] = len(labs)
+                amb_reread += 1
+                items.append(item)
+                continue
+            # non-strict: pick deterministically (labs already sorted)
+            item["match_status"] = "matched_with_reread_duplicates"
+            matched_with_reread_dupes += 1
+        else:
+            item["match_status"] = "matched"
+
         matched += 1
-        item["match_status"] = "matched"
-        dup_ct = sig_label_counts.get(sig, 1)
-        if dup_ct > 1:
-            item["reread_label_duplicates_for_sig"] = int(dup_ct)
 
         stl_rel = f"stl/{part_id}.stl"
         stl_path = out_dir / stl_rel
 
         if overwrite_stl or (not stl_path.exists()):
-            shp = _shape_from_label(shape_tool, lab)
+            shp = _shape_from_label(shape_tool, labs[0])
             if shp is None:
                 item["match_status"] = "matched_but_shape_missing"
                 unmatched += 1
@@ -619,13 +551,6 @@ def build_manifest(
             "xcaf_instances": xcaf_instances_path.name,
             "sig_algo": algo,
             "use_sig_free": bool(use_sig_free),
-            "env": {
-                "STEP_BBOX_TOL_MM": float(BBOX_TOL_MM),
-                "STEP2_LINEAR_DEFLECTION": float(DEFAULT_LINEAR_DEFLECTION),
-                "STEP2_ANGULAR_DEFLECTION": float(DEFAULT_ANGULAR_DEFLECTION),
-                "STEP2_MAX_SHAPED_DEFS_GUARD": int(MAX_SHAPED_DEFS_GUARD),
-                "STEP2_MAX_LABELS_GUARD": int(MAX_LABELS_GUARD),
-            },
             "mesh": {
                 "linear_deflection_mm": float(linear_deflection),
                 "angular_deflection_rad": float(angular_deflection),
@@ -636,12 +561,11 @@ def build_manifest(
                 "labels_reread_total": len(labels),
                 "labels_with_null_shape": null_shapes,
                 "sig_fail_count": sig_fail,
-                "reread_sig_duplicate_count": int(reread_sig_dupe_count),
-                "reread_sig_duplicate_max": int(reread_sig_dupe_max),
                 "matched": matched,
                 "unmatched": unmatched,
                 "ambiguous_step1": amb_step1,
                 "ambiguous_reread": amb_reread,
+                "matched_with_reread_dupes": matched_with_reread_dupes,
                 "exported": exported,
                 "skipped_existing": skipped_existing,
                 "missing_sig_fields_step1": missing_sig_fields,
@@ -655,6 +579,25 @@ def build_manifest(
     }
     return manifest
 
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_truthy(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    t = str(v).strip().lower()
+    return not (t in ("0", "false", "no", "off"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--step-path", required=True, help="Path to STEP (e.g. /in/model.step)")
@@ -664,15 +607,19 @@ def main() -> int:
     ap.add_argument("--overwrite", action="store_true", help="Overwrite STLs if they already exist")
     ap.add_argument("--ascii-stl", action="store_true", help="Write ASCII STL")
 
-    # Defaults come from env-backed constants above
-    ap.add_argument("--linear-deflection", type=float, default=DEFAULT_LINEAR_DEFLECTION)
-    ap.add_argument("--angular-deflection", type=float, default=DEFAULT_ANGULAR_DEFLECTION)
+    ap.add_argument("--linear-deflection", type=float, default=None)
+    ap.add_argument("--angular-deflection", type=float, default=None)
 
     ap.add_argument("--use-sig-free", action="store_true", help="Prefer def_sig_free when available")
     ap.add_argument("--strict", action="store_true", help="Fail if any unmatched or ambiguous defs occur")
     ap.add_argument("--strict-signature-collisions", action="store_true", help="Fail immediately if Step 1 collisions exist")
 
     ns = ap.parse_args()
+
+    # allow .env defaults via docker --env-file, while still letting CLI override
+    linear_deflection = float(ns.linear_deflection) if ns.linear_deflection is not None else _env_float("STL_LINEAR_DEFLECTION", DEFAULT_LINEAR_DEFLECTION)
+    angular_deflection = float(ns.angular_deflection) if ns.angular_deflection is not None else _env_float("STL_ANGULAR_DEFLECTION", DEFAULT_ANGULAR_DEFLECTION)
+    ascii_stl = bool(ns.ascii_stl) or _env_truthy("STL_ASCII", False)
 
     step_path = Path(ns.step_path)
     out_dir = Path(ns.out_dir)
@@ -683,15 +630,15 @@ def main() -> int:
         out_dir=out_dir,
         xcaf_instances_path=xcaf_path,
         overwrite_stl=bool(ns.overwrite),
-        ascii_stl=bool(ns.ascii_stl),
-        linear_deflection=float(ns.linear_deflection),
-        angular_deflection=float(ns.angular_deflection),
-        use_sig_free=bool(ns.use_sig_free),
+        ascii_stl=ascii_stl,
+        linear_deflection=linear_deflection,
+        angular_deflection=angular_deflection,
+        use_sig_free=bool(ns.use_sig_free) or _env_truthy("USE_SIG_FREE", False),
         strict=bool(ns.strict),
         strict_signature_collisions=bool(ns.strict_signature_collisions),
     )
 
-    out_manifest = out_dir / "stl_manifest.json"
+    out_manifest = out_dir / "assets_manifest.json"
     _write_json(out_manifest, manifest)
 
     c = manifest["meta"]["counts"]
@@ -701,11 +648,13 @@ def main() -> int:
     print(
         f"  matched={c['matched']} unmatched={c['unmatched']} "
         f"amb_step1={c['ambiguous_step1']} amb_reread={c['ambiguous_reread']} "
+        f"matched_with_dupes={c['matched_with_reread_dupes']} "
         f"exported={c['exported']} skipped_existing={c['skipped_existing']}"
     )
     if manifest["meta"]["warnings"]["step1_signature_collisions_present"]:
         print(f"  WARNING: Step 1 signature collisions present: {c['step1_signature_collision_count']} sigs")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

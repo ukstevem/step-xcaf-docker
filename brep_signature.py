@@ -19,11 +19,12 @@ import math
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as _np
 
 from OCP.GProp import GProp_GProps
+from OCP.BRepGProp import BRepGProp as _BRepGProp  # <-- DO NOT SHADOW THIS
 from OCP.TopAbs import (
     TopAbs_VERTEX,
     TopAbs_EDGE,
@@ -39,6 +40,7 @@ from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
 from OCP.BRepTools import BRepTools
 from OCP.BRep import BRep_Tool
 from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib
 from OCP.GeomAbs import (
     GeomAbs_Plane,
     GeomAbs_Cylinder,
@@ -62,21 +64,17 @@ from OCP.GeomAbs import (
     GeomAbs_OtherCurve,
 )
 
-import OCP.BRepGProp as BRepGProp
-import OCP.BRepBndLib as BRepBndLib
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-# Bumped because payload changed (location-sensitive features added).
 DEF_SIG_ALGO = "brep_features_v5_ocp_sha256"
 
 
 def call_maybe_s(obj, method: str, *args):
     """
     Call obj.method(*args) or obj.method_s(*args) for OCP binding variants.
+    Use this for NON-BRepGProp things. (BRepGProp is handled explicitly below.)
     """
     fn = getattr(obj, method, None)
     if callable(fn):
@@ -110,6 +108,44 @@ def compute_def_sig_free(shape) -> str:
     """
     payload = _compute_feature_payload(shape, mirror_invariant=True)
     return _hash_payload(payload)
+
+
+# ---------------------------------------------------------------------------
+# BRepGProp binding-safe wrappers (YOUR CONTAINER PROVIDES ONLY *_s)
+# ---------------------------------------------------------------------------
+
+def _vol_props(shape, props) -> None:
+    """
+    Use VolumeProperties_s if available; else VolumePropertiesGK_s.
+    """
+    fn = getattr(_BRepGProp, "VolumeProperties_s", None)
+    if callable(fn):
+        try:
+            fn(shape, props)
+            return
+        except Exception:
+            pass
+    fn = getattr(_BRepGProp, "VolumePropertiesGK_s", None)
+    if callable(fn):
+        fn(shape, props)
+        return
+    raise AttributeError("BRepGProp has no VolumeProperties_s / VolumePropertiesGK_s")
+
+
+def _surf_props(shape, props) -> None:
+    fn = getattr(_BRepGProp, "SurfaceProperties_s", None)
+    if callable(fn):
+        fn(shape, props)
+        return
+    raise AttributeError("BRepGProp has no SurfaceProperties_s")
+
+
+def _lin_props(shape, props) -> None:
+    fn = getattr(_BRepGProp, "LinearProperties_s", None)
+    if callable(fn):
+        fn(shape, props)
+        return
+    raise AttributeError("BRepGProp has no LinearProperties_s")
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +280,11 @@ def _volume_area_centroid_inertia(shape) -> Tuple[float, float, Tuple[float, flo
       inertia 3x3 matrix about origin (from props_v.MatrixOfInertia when available)
     """
     props_v = GProp_GProps()
-    call_maybe_s(BRepGProp, "VolumeProperties", shape, props_v)
+    _vol_props(shape, props_v)
     vol = float(props_v.Mass())
 
     props_a = GProp_GProps()
-    call_maybe_s(BRepGProp, "SurfaceProperties", shape, props_a)
+    _surf_props(shape, props_a)
     area = float(props_a.Mass())
 
     try:
@@ -285,11 +321,11 @@ def _volume_area_centroid_inertia(shape) -> Tuple[float, float, Tuple[float, flo
 
 def _volume_area_moments_quant(shape) -> Tuple[int, int, Tuple[int, int, int], Tuple[int, int]]:
     props_v = GProp_GProps()
-    call_maybe_s(BRepGProp, "VolumeProperties", shape, props_v)
+    _vol_props(shape, props_v)
     vol = float(props_v.Mass())
 
     props_a = GProp_GProps()
-    call_maybe_s(BRepGProp, "SurfaceProperties", shape, props_a)
+    _surf_props(shape, props_a)
     area = float(props_a.Mass())
 
     moms = [0.0, 0.0, 0.0]
@@ -330,13 +366,13 @@ def _aabb_extents_sorted(shape) -> Tuple[int, int, int]:
 
 def _face_area(face) -> float:
     props = GProp_GProps()
-    call_maybe_s(BRepGProp, "SurfaceProperties", face, props)
+    _surf_props(face, props)
     return float(props.Mass())
 
 
 def _edge_length(edge) -> float:
     props = GProp_GProps()
-    call_maybe_s(BRepGProp, "LinearProperties", edge, props)
+    _lin_props(edge, props)
     return float(props.Mass())
 
 
@@ -409,17 +445,14 @@ def _frame_from_inertia(shape) -> Tuple[Tuple[float, float, float], _np.ndarray,
         evals = _np.array([0.0, 0.0, 0.0], dtype=float)
         evecs = _np.eye(3, dtype=float)
 
-    # Candidate axes are columns of evecs
     axes = [evecs[:, 0].copy(), evecs[:, 1].copy(), evecs[:, 2].copy()]
 
-    # If matrix was junk, fallback to world axes
     for i in range(3):
         if float(_np.linalg.norm(axes[i])) <= 1e-30:
             axes[i] = _np.array([1.0, 0.0, 0.0], dtype=float) if i == 0 else (
                 _np.array([0.0, 1.0, 0.0], dtype=float) if i == 1 else _np.array([0.0, 0.0, 1.0], dtype=float)
             )
 
-    # Compute extents along each axis using a bounded set of vertices
     pts = _iter_vertex_points(shape, _Q.MAX_SIGN_VERTS)
     if not pts:
         pts = [(cx, cy, cz)]
@@ -437,7 +470,6 @@ def _frame_from_inertia(shape) -> Tuple[Tuple[float, float, float], _np.ndarray,
         ext = pmax - pmin
         extents.append((ext, pmin, pmax))
 
-    # Order axes by decreasing extent (more stable than raw eigenvalue order).
     order = list(range(3))
     order.sort(key=lambda i: (-extents[i][0], -abs(extents[i][2]), -abs(extents[i][1])))
 
@@ -445,12 +477,10 @@ def _frame_from_inertia(shape) -> Tuple[Tuple[float, float, float], _np.ndarray,
     v0 = _normalize(axes[order[1]])
     w0 = _normalize(axes[order[2]])
 
-    # Canonical sign for each axis (largest component positive)
     u0 = _canonicalize_axis_sign(u0)
     v0 = _canonicalize_axis_sign(v0)
     w0 = _canonicalize_axis_sign(w0)
 
-    # Make right-handed; align w with w0
     u, v, w = _make_right_handed(u0, v0, w0)
 
     diag = {
@@ -473,7 +503,6 @@ def _dir_to_local(dxyz: Tuple[float, float, float], u: _np.ndarray, v: _np.ndarr
     dx, dy, dz = dxyz
     d = _np.array([dx, dy, dz], dtype=float)
     dl = (_np.dot(d, u), _np.dot(d, v), _np.dot(d, w))
-    # Normalize
     n = math.sqrt(float(dl[0] * dl[0] + dl[1] * dl[1] + dl[2] * dl[2]))
     if n <= 1e-30:
         return (0.0, 0.0, 0.0)
@@ -481,9 +510,6 @@ def _dir_to_local(dxyz: Tuple[float, float, float], u: _np.ndarray, v: _np.ndarr
 
 
 def _canon_dir_local(dl: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """
-    Canonicalize direction sign: make the largest-magnitude component positive.
-    """
     x, y, z = dl
     a = [x, y, z]
     idx = 0
@@ -575,10 +601,6 @@ def _face_normal_quantized(face, *, mirror_invariant: bool) -> Optional[Tuple[in
 # ---------------------------------------------------------------------------
 
 def _plane_inner_wire_count(face) -> int:
-    """
-    Count inner wires (holes) on a planar face.
-    Deterministic and bounded.
-    """
     try:
         outer = BRepTools.OuterWire(face)
     except Exception:
@@ -601,7 +623,6 @@ def _plane_inner_wire_count(face) -> int:
             pass
         itw.Next()
 
-    # Guard: cap to a sane range (still deterministic)
     if cnt < 0:
         cnt = 0
     if cnt > 9999:
@@ -610,10 +631,6 @@ def _plane_inner_wire_count(face) -> int:
 
 
 def _cylinder_length_from_uv(face) -> float:
-    """
-    For GeomAbs_Cylinder, V parameter usually corresponds to axis direction (height).
-    Use UV bounds if available.
-    """
     try:
         umin, umax, vmin, vmax = BRepTools.UVBounds_s(face)
     except Exception:
@@ -633,28 +650,17 @@ def _compute_cylinder_features(
     *,
     mirror_invariant: bool,
 ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], int]:
-    """
-    Returns:
-      cyl_desc_hist: histogram of per-cylinder descriptors (string key -> count)
-      cyl_r_hist: histogram of radius bins
-      cyl_pos_bins: sparse 3D grid bins (i,j,k -> count)
-      n_cyl_faces: number of cylindrical faces detected
-    """
     cyl_desc_hist = Counter()
     cyl_r_hist = Counter()
     pos_bins = Counter()
 
-    # For positional binning, we need extents in local frame.
-    # Use a bounded set of vertices for extents (consistent with frame calc).
     pts = _iter_vertex_points(shape, _Q.MAX_SIGN_VERTS)
     if not pts:
         pts = [origin]
 
-    # Compute local coords for extents
     locs = [_to_local(p, origin, u, v, w) for p in pts]
 
     if mirror_invariant:
-        # abs extents [0..maxAbs]
         maxx = max(abs(x) for (x, _, _) in locs) if locs else 0.0
         maxy = max(abs(y) for (_, y, _) in locs) if locs else 0.0
         maxz = max(abs(z) for (_, _, z) in locs) if locs else 0.0
@@ -686,11 +692,9 @@ def _compute_cylinder_features(
 
         if st == GeomAbs_Cylinder:
             n_cyl_faces += 1
-
             try:
                 cyl = s.Cylinder()
                 r = float(cyl.Radius())
-                # Axis location + direction in world
                 ax1 = cyl.Axis()
                 p0 = ax1.Location()
                 d0 = ax1.Direction()
@@ -700,27 +704,21 @@ def _compute_cylinder_features(
                 itf.Next()
                 continue
 
-            # Local frame coords
             pl = _to_local(p, origin, u, v, w)
             dl = _dir_to_local(d, u, v, w)
             dl = _canon_dir_local(dl)
 
-            # Mirror invariance handled by quantizers
             rq = _q_int(r, _Q.RAD_STEP)
             pq = _q_pos3(pl[0], pl[1], pl[2], mirror_invariant=mirror_invariant)
             dq = _q_norm3(dl[0], dl[1], dl[2], mirror_invariant=mirror_invariant)
 
-            # Length estimate
             L = _cylinder_length_from_uv(face)
             Lq = _q_int(L, _Q.LEN_STEP)
 
-            # Descriptor key (deterministic string)
-            # Includes radius + dir + pos + length
             key = f"r{rq}|d{dq[0]},{dq[1]},{dq[2]}|p{pq[0]},{pq[1]},{pq[2]}|L{Lq}"
             cyl_desc_hist[key] += 1
             cyl_r_hist[rq] += 1
 
-            # Positional binning: map to GRID_N in each axis
             gx = (abs(pl[0]) if mirror_invariant else pl[0])
             gy = (abs(pl[1]) if mirror_invariant else pl[1])
             gz = (abs(pl[2]) if mirror_invariant else pl[2])
@@ -728,12 +726,10 @@ def _compute_cylinder_features(
             nx = (gx - minx) / (maxx - minx)
             ny = (gy - miny) / (maxy - miny)
             nz = (gz - minz) / (maxz - minz)
-            # clamp
             nx = 0.0 if nx < 0.0 else (1.0 if nx > 1.0 else nx)
             ny = 0.0 if ny < 0.0 else (1.0 if ny > 1.0 else ny)
             nz = 0.0 if nz < 0.0 else (1.0 if nz > 1.0 else nz)
 
-            # bin index in [0..GRID_N-1]
             N = int(_Q.GRID_N)
             ix = int(min(N - 1, math.floor(nx * N)))
             iy = int(min(N - 1, math.floor(ny * N)))
@@ -741,8 +737,6 @@ def _compute_cylinder_features(
             pos_bins[(ix, iy, iz)] += 1
 
         itf.Next()
-
-        # Guard: bounded traversal (already bounded by MAX_FACES, but keep explicit)
         if n_cyl_faces > _Q.MAX_CYL_FACES:
             break
 
@@ -777,10 +771,8 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
     ext_q = _aabb_extents_sorted(shape)
     chi = topo["n_vertex"] - topo["n_edge"] + topo["n_face"]
 
-    # Stable local frame (principal-ish)
     origin, u, v, w, frame_diag = _frame_from_inertia(shape)
 
-    # Face features (existing + planar inner wires)
     face_type_counts = Counter()
     face_area_frac_hist = Counter()
     face_norm_hist = Counter()
@@ -793,7 +785,6 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
 
     plane_inner_wire_hist = Counter()
 
-    # Total area approx from quantized area (for stable fraction binning)
     total_area = max(1e-30, float(area_q) * _Q.AREA_STEP)
 
     itf = TopExp_Explorer(shape, TopAbs_FACE)
@@ -808,7 +799,6 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
         st_name = _surface_type_name(st)
         face_type_counts[st_name] += 1
 
-        # area bins
         try:
             a = _face_area(face)
         except Exception:
@@ -822,17 +812,15 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
         if nbin is not None:
             face_norm_hist[nbin] += 1
 
-        # planar inner wire counts
         if st == GeomAbs_Plane:
             plane_inner_wire_hist[_plane_inner_wire_count(face)] += 1
 
-        # type-specific parameters
         try:
             if st == GeomAbs_Cylinder:
                 r = float(s.Cylinder().Radius())
                 cyl_r_hist[_q_int(r, _Q.RAD_STEP)] += 1
             elif st == GeomAbs_Cone:
-                ang = float(s.Cone().SemiAngle())  # radians
+                ang = float(s.Cone().SemiAngle())
                 cone_ang_hist[_q_deg(math.degrees(ang))] += 1
             elif st == GeomAbs_Sphere:
                 r = float(s.Sphere().Radius())
@@ -847,7 +835,6 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
 
         itf.Next()
 
-    # Edge features (existing)
     edge_type_counts = Counter()
     edge_len_hist = Counter()
     circle_r_hist = Counter()
@@ -878,7 +865,6 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
 
         ite.Next()
 
-    # New cylinder descriptors + positional bins in stable frame
     cyl_desc_hist, cyl_r_hist2, cyl_pos_bins, n_cyl_faces = _compute_cylinder_features(
         shape, origin, u, v, w, mirror_invariant=mirror_invariant
     )
@@ -893,8 +879,6 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
             "mom_ratio_q": [int(ratios_q[0]), int(ratios_q[1])],
             "aabb_ext_q_sorted": [int(ext_q[0]), int(ext_q[1]), int(ext_q[2])],
             "chi": int(chi),
-            # Frame diagnostics included (quantized-ish) for stability/debug.
-            # Not huge, deterministic.
             "frame_diag": frame_diag,
         },
         "faces": {
@@ -915,11 +899,8 @@ def _compute_feature_payload(shape, *, mirror_invariant: bool) -> Dict[str, Any]
         },
         "cylinders": {
             "n_cyl_faces": int(n_cyl_faces),
-            # Redundant but useful: radius bins from descriptor pass
             "r_hist": cyl_r_hist2,
-            # Location-sensitive descriptors (most collision-breaking)
             "desc_hist": cyl_desc_hist,
-            # Coarse position bins (<= 8^3 keys, sparse)
             "pos_bins": cyl_pos_bins,
         },
     }
@@ -955,12 +936,10 @@ def _debug_print_summary(payload: Dict[str, Any]) -> None:
               f"n_cyl_faces={cyl.get('n_cyl_faces')} desc_keys={len(cyl.get('desc_hist', {}))} "
               f"pos_keys={len(cyl.get('pos_bins', {}))}")
 
-        # top radius bins
         r_hist = Counter({k: int(v) for k, v in (cyl.get("r_hist", {}) or {}).items()})
         if r_hist:
             print(f"[SIG_DEBUG] cylinders.r_hist top{_Q.DEBUG_TOP_N}:", _topn(r_hist, _Q.DEBUG_TOP_N))
 
-        # top pos bins
         p_hist = Counter({k: int(v) for k, v in (cyl.get("pos_bins", {}) or {}).items()})
         if p_hist:
             print(f"[SIG_DEBUG] cylinders.pos_bins top{_Q.DEBUG_TOP_N}:", _topn(p_hist, _Q.DEBUG_TOP_N))
@@ -974,12 +953,6 @@ def _debug_print_summary(payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def diff_sig_features(shape_a, shape_b, *, mirror_invariant: bool = False, max_items: int = 20) -> Dict[str, Any]:
-    """
-    Compute payloads (sig or sig_free style depending on mirror_invariant),
-    and return a bounded diff report.
-
-    max_items caps per-histogram key diffs.
-    """
     pa = _compute_feature_payload(shape_a, mirror_invariant=mirror_invariant)
     pb = _compute_feature_payload(shape_b, mirror_invariant=mirror_invariant)
 
@@ -994,7 +967,6 @@ def diff_sig_features(shape_a, shape_b, *, mirror_invariant: bool = False, max_i
         "hist_diffs": {},
     }
 
-    # Props scalar diffs
     props_a = pa.get("props", {})
     props_b = pb.get("props", {})
     for k in ("vol_q", "area_q", "moms_q", "mom_ratio_q", "aabb_ext_q_sorted", "chi", "frame_diag"):
@@ -1013,25 +985,21 @@ def diff_sig_features(shape_a, shape_b, *, mirror_invariant: bool = False, max_i
         if diffs:
             out["hist_diffs"][path] = diffs
 
-    # Compare groups
     for group in ("faces", "edges", "cylinders"):
         ga = pa.get(group, {}) or {}
         gb = pb.get(group, {}) or {}
         if ga != gb:
             out["groups_differ"].append(group)
 
-    # faces
     fa, fb = pa.get("faces", {}) or {}, pb.get("faces", {}) or {}
     for h in ("type_counts", "area_q_hist", "area_frac_hist", "norm_hist", "cyl_r_hist",
               "cone_ang_hist", "sphere_r_hist", "torus_rr_hist", "plane_inner_wires_hist"):
         diff_hist(f"faces.{h}", fa.get(h, {}) or {}, fb.get(h, {}) or {})
 
-    # edges
     ea, eb = pa.get("edges", {}) or {}, pb.get("edges", {}) or {}
     for h in ("type_counts", "len_q_hist", "circle_r_hist"):
         diff_hist(f"edges.{h}", ea.get(h, {}) or {}, eb.get(h, {}) or {})
 
-    # cylinders
     ca, cb = pa.get("cylinders", {}) or {}, pb.get("cylinders", {}) or {}
     for h in ("r_hist", "desc_hist", "pos_bins"):
         diff_hist(f"cylinders.{h}", ca.get(h, {}) or {}, cb.get(h, {}) or {})

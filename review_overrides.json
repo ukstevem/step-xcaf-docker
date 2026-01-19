@@ -1,0 +1,10 @@
+{
+  "schema": "step4_review_overrides_v1",
+  "items": {
+    "<override_key>": {
+      "confirmed_category": "SECTION",
+      "explode_decision": "YES|NO|NOT_SURE",
+      "notes": "optional"
+    }
+  }
+}

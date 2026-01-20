@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from datetime import datetime, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -16,25 +15,46 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _write_decisions_csv(path: Path, decisions: List[Dict[str, str]]) -> int:
-    cols = ["def_sig", "decision", "note"]
+def _write_decisions_json(path: Path, decisions: List[Dict[str, str]]) -> int:
+    """
+    Writes:
+      {
+        "schema": "multibody_decisions_v1",
+        "updated_utc": "...",
+        "decisions": {
+          "<def_sig>": {"decision":"...", "note":"...", "updated_utc":"..."},
+          ...
+        }
+      }
+    Returns number of decisions written.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        n = 0
-        for d in decisions:
-            sig = (d.get("def_sig") or "").strip()
-            if not sig:
-                continue
-            decision = (d.get("decision") or "defer").strip()
-            note = (d.get("note") or "").strip()
-            if decision not in DECISION_ENUM:
-                decision = "defer"
-            w.writerow({"def_sig": sig, "decision": decision, "note": note})
-            n += 1
-    return n
 
+    ts = _now_utc_iso()
+    dec_map: Dict[str, Dict[str, str]] = {}
+
+    # Keep last occurrence per sig (deterministic: iterate in input order, overwrite)
+    n = 0
+    for d in decisions:
+        sig = (d.get("def_sig") or "").strip()
+        if not sig:
+            continue
+        decision = (d.get("decision") or "defer").strip()
+        note = (d.get("note") or "").strip()
+        if decision not in DECISION_ENUM:
+            decision = "defer"
+
+        dec_map[sig] = {"decision": decision, "note": note, "updated_utc": ts}
+        n += 1
+
+    obj = {
+        "schema": "multibody_decisions_v1",
+        "updated_utc": ts,
+        "decisions": dec_map,
+    }
+
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return n
 
 def _append_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,7 +67,7 @@ class Handler(SimpleHTTPRequestHandler):
     # These will be set on the class before server starts
     OUTDIR: Path = Path(".")
     UI_DIR: Path = Path(".")
-    DECISIONS_CSV: Path = Path(".")
+    DECISIONS_JSON: Path = Path(".")
     DECISIONS_LOG: Path = Path(".")
 
     def _send_json(self, obj: Any, code: int = 200) -> None:
@@ -115,7 +135,7 @@ class Handler(SimpleHTTPRequestHandler):
                 }
             )
 
-        updated = _write_decisions_csv(self.DECISIONS_CSV, norm)
+        updated = _write_decisions_json(self.DECISIONS_JSON, norm)
         _append_jsonl(self.DECISIONS_LOG, log_rows)
 
         return self._send_json({"ok": True, "updated": updated})
@@ -137,7 +157,7 @@ def main() -> int:
     # Serve files from ui_dir
     Handler.OUTDIR = outdir
     Handler.UI_DIR = ui_dir
-    Handler.DECISIONS_CSV = outdir / "review" / "multibody_decisions.csv"
+    Handler.DECISIONS_JSON = outdir / "review" / "multibody_decisions.json"
     Handler.DECISIONS_LOG = outdir / "review" / "multibody_decisions_log.jsonl"
 
     # Switch CWD so SimpleHTTPRequestHandler serves ui_dir

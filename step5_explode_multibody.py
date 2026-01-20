@@ -2,7 +2,7 @@
 """
 Step 5: Explode Approved Multi-Body
 
-- Reads:  out/review/multibody_decisions.csv
+- Reads:  out/review/multibody_decisions.json
 - Reads:  out/xcaf_instances.json (best-effort metadata, qty/name lookup)
 - Re-reads STEP via XCAF and resolves definition shapes by stable IDs (def_sig / def_sig_free)
 - Explodes approved multi-body definitions into subparts (solids)
@@ -20,7 +20,6 @@ Power-of-10 style:
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as _dt
 import hashlib
 import json
@@ -356,33 +355,47 @@ def _write_stl(shape, out_path: Path) -> None:
 # Decisions + metadata readers
 # -----------------------------
 
-def _load_decisions(decisions_csv: Path) -> List[Dict[str, str]]:
-    _require_file(decisions_csv, "multibody_decisions.csv")
-    with open(decisions_csv, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise RuntimeError(f"{decisions_csv} has no header row.")
+def _load_decisions_json(decisions_json: Path) -> List[Dict[str, str]]:
+    """
+    Expected format:
+    {
+      "decisions": {
+        "<def_sig>": {"decision": "explode|defer|...", "note": "...", "updated_utc": "..."},
+        ...
+      }
+    }
 
-        expected = ["def_sig", "decision", "note"]
-        got = [h.strip() if h else "" for h in reader.fieldnames]
+    Returns a list of dicts: [{"def_sig":..., "decision":..., "note":...}, ...]
+    Deterministic ordering is handled later (we sort approved keys).
+    """
+    _require_file(decisions_json, "multibody_decisions.json")
+    with open(decisions_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        if got != expected:
-            raise RuntimeError(
-                "multibody_decisions.csv headers must be exactly:\n"
-                "  def_sig,decision,note\n"
-                f"Got:\n  {','.join(got)}"
-            )
+    decisions = data.get("decisions")
+    if not isinstance(decisions, dict):
+        raise RuntimeError(
+            f"{decisions_json} must contain an object at key 'decisions' mapping def_sig -> record."
+        )
 
-        rows: List[Dict[str, str]] = []
-        for r in reader:
-            def_sig = (r.get("def_sig") or "").strip()
-            decision = (r.get("decision") or "").strip()
-            note = (r.get("note") or "").strip()
-            if def_sig == "":
-                continue
-            rows.append({"def_sig": def_sig, "decision": decision, "note": note})
-        return rows
+    rows: List[Dict[str, str]] = []
+    for def_sig, rec in decisions.items():
+        if not isinstance(def_sig, str) or def_sig.strip() == "":
+            continue
+        if not isinstance(rec, dict):
+            continue
 
+        decision = str(rec.get("decision") or "").strip()
+        note = str(rec.get("note") or "").strip()
+
+        rows.append({
+            "def_sig": def_sig.strip(),
+            "decision": decision,
+            "note": note,
+            "updated_utc": str(rec.get("updated_utc") or ""),
+            })
+
+    return rows
 
 def _load_xcaf_instances_meta(xcaf_instances_json: Path) -> Dict[str, Any]:
     if not xcaf_instances_json.is_file():
@@ -424,10 +437,10 @@ def run_step5(
     out_dir: Path,
 ) -> int:
     out_dir = out_dir.resolve()
-    decisions_csv = out_dir / "review" / "multibody_decisions.csv"
+    decisions_json = out_dir / "review" / "multibody_decisions.json"
     xcaf_instances_json = out_dir / "xcaf_instances.json"
 
-    _require_file(decisions_csv, "out/review/multibody_decisions.csv")
+    _require_file(decisions_json, "out/review/multibody_decisions.json")
 
     exploded_root = out_dir / "exploded"
     stl_root = exploded_root / "stl"
@@ -437,7 +450,7 @@ def run_step5(
     parts_json_path = exploded_root / "exploded_parts.json"
     log_path = exploded_root / "explode_log.jsonl"
 
-    decisions = _load_decisions(decisions_csv)
+    decisions = _load_decisions_json(decisions_json)
     meta = _load_xcaf_instances_meta(xcaf_instances_json)
 
     approved = [r for r in decisions if r["decision"].strip().lower() == "explode"]

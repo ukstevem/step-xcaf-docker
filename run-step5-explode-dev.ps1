@@ -17,15 +17,16 @@ function Require-File([string] $p, [string] $label) {
 
 $RepoRoot = (Resolve-Path ".").Path
 $OutAbs   = (Resolve-Path $OutDir).Path
-$dec = Join-Path $OutAbs "review\multibody_decisions.csv"
+
+# JSON decisions (new canonical)
+$dec = Join-Path $OutAbs "review\multibody_decisions.json"
 
 # Inputs that must already exist from Steps 1-4
-Require-File (Join-Path $OutAbs "review\multibody_decisions.csv") "out\review\multibody_decisions.csv"
+Require-File $dec "out\review\multibody_decisions.json"
 Require-File (Join-Path $OutAbs "xcaf_instances.json") "out\xcaf_instances.json"
 Require-File (Join-Path $RepoRoot "step5_explode_multibody.py") "step5_explode_multibody.py"
-Require-File $dec "out\review\multibody_decisions.csv"
 
-if ((Get-Item $dec).Length -lt 20) { throw "multibody_decisions.csv looks too small: $dec" }
+if ((Get-Item $dec).Length -lt 40) { throw "multibody_decisions.json looks too small: $dec" }
 
 # Resolve STEP path and mount its directory
 $StepAbs = (Resolve-Path $StepPath).Path

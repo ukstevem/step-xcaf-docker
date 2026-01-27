@@ -1,0 +1,15 @@
+services:
+  ui:
+    build: .
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    volumes:
+      - ./:/repo
+    environment:
+      PYTHONPATH: /repo
+      ANALYZE_CMD: 'python /repo/read_step_xcaf.py --with_massprops "{step}" "{out}"'
+      ASSEMBLY_STL_REL: "assembly.stl"
+    ports:
+      - "8080:8080"
+    entrypoint: []
+    command: ["python", "-m", "uvicorn", "ui_server:app", "--host", "0.0.0.0", "--port", "8080"]

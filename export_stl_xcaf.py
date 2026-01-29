@@ -272,37 +272,116 @@ def _label_entry_str(lab) -> str:
 # -----------------------------
 # Meshing / STL writing
 # -----------------------------
-def _mesh_shape(shape, linear_deflection: float, angular_deflection: float) -> None:
+def _mesh_shape(shape: Any, linear_deflection: float, angular_deflection: float) -> bool:
+    """Mesh a shape before STL export.
+
+    OCCT/OCP signatures vary a bit by version, so we:
+      - try the full (lin, isRelative, ang, parallel) constructor first
+      - fall back to the simple (lin) constructor
+      - call Perform() if available
+      - check IsDone() if available
+
+    Returns True if meshing appears to have completed.
+    """
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+
+    lin = float(linear_deflection)
+    ang = float(angular_deflection)
+
     try:
-        mesh = BRepMesh_IncrementalMesh(shape, float(linear_deflection), False, float(angular_deflection), False)
-        if hasattr(mesh, "Perform"):
-            mesh.Perform()
+        m = BRepMesh_IncrementalMesh(shape, lin, False, ang, True)
     except TypeError:
-        mesh = BRepMesh_IncrementalMesh(shape, float(linear_deflection))
-        if hasattr(mesh, "Perform"):
-            mesh.Perform()
+        m = BRepMesh_IncrementalMesh(shape, lin)
 
+    try:
+        m.Perform()
+    except Exception:
+        # some bindings perform in ctor
+        pass
 
-def _write_stl(shape, out_path: Path, ascii_mode: bool) -> None:
+    try:
+        if hasattr(m, "IsDone") and (not m.IsDone()):
+            return False
+    except Exception:
+        pass
+
+    return True
+
+def _write_stl(
+    shape: Any,
+    out_path: Path,
+    ascii_stl: bool,
+    *,
+    linear_deflection: float,
+    angular_deflection: float,
+) -> tuple[bool, str]:
+    """Write an STL for `shape` to `out_path`.
+
+    Returns (ok, message). On some OCP/OCCT builds StlAPI_Writer.Write()
+    returns False even when it partially wrote a file; we therefore
+    validate by checking file existence + non-trivial size.
+    """
+    if shape is None:
+        return (False, "shape is None")
+
+    try:
+        if hasattr(shape, "IsNull") and shape.IsNull():
+            return (False, "shape.IsNull()")
+    except Exception:
+        pass
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    wr = StlAPI_Writer()
-    if hasattr(wr, "SetASCIIMode"):
+
+    from OCP.StlAPI import StlAPI_Writer
+
+    writer = StlAPI_Writer()
+    try:
+        writer.SetASCIIMode(bool(ascii_stl))
+    except Exception:
+        pass
+
+    # Retry with finer meshing if needed. Some very small parts can fail
+    # to triangulate at coarse deflection and cause Write() to return False.
+    lin0 = max(1e-6, float(linear_deflection))
+    ang0 = max(1e-9, float(angular_deflection))
+    lin_try = [lin0, lin0 * 0.5, lin0 * 0.25]
+
+    last_msg = ""
+    for lin in lin_try:
         try:
-            wr.SetASCIIMode(bool(ascii_mode))
+            _mesh_shape(shape, lin, ang0)
+        except Exception as e:
+            last_msg = f"meshing failed: {e}"
+            continue
+
+        ok = False
+        try:
+            ok = bool(writer.Write(shape, str(out_path)))
+        except Exception as e:
+            last_msg = f"Write() exception: {e}"
+            ok = False
+
+        # Confirm by checking output file; avoids false negatives.
+        try:
+            if out_path.exists():
+                sz = out_path.stat().st_size
+                if sz > 84:  # STL header-only is ~84 bytes
+                    return (True, f"wrote {sz} bytes (lin={lin:g}, ok={ok})")
+        except Exception as e:
+            last_msg = f"post-check failed: {e}"
+
+        last_msg = f"Write() returned {ok} (lin={lin:g})"
+
+        # Clean up any header-only / empty output before retrying
+        try:
+            if out_path.exists() and out_path.stat().st_size <= 84:
+                out_path.unlink(missing_ok=True)
         except Exception:
             pass
-    ok = False
-    try:
-        ok = bool(wr.Write(shape, str(out_path)))
-    except Exception:
-        ok = False
-    if not ok and not out_path.exists():
-        raise RuntimeError(f"Failed to write STL: {out_path}")
+
+    return (False, f"Failed to write STL: {out_path} ({last_msg})")
 
 
-# -----------------------------
-# Main build
-# -----------------------------
 def build_manifest(
     *,
     step_path: Path,
@@ -445,6 +524,8 @@ def build_manifest(
     amb_reread = 0
     exported = 0
     skipped_existing = 0
+    failed_write = 0
+
     matched_with_reread_dupes = 0
 
     for i, def_id in enumerate(shaped_def_ids, start=1):
@@ -523,7 +604,24 @@ def build_manifest(
                 items.append(item)
                 continue
             _mesh_shape(shp, linear_deflection, angular_deflection)
-            _write_stl(shp, stl_path, ascii_stl)
+
+            ok_write, write_msg = _write_stl(
+                shp,
+                stl_path,
+                ascii_stl,
+                linear_deflection=linear_deflection,
+                angular_deflection=angular_deflection,
+            )
+            if not ok_write:
+                failed_write += 1
+                item["stl_path"] = None
+                item["stl_error"] = write_msg
+                item["match_status"] = "stl_write_failed"
+                if strict:
+                    raise RuntimeError(write_msg)
+                items.append(item)
+                continue
+
             exported += 1
         else:
             skipped_existing += 1
@@ -568,6 +666,7 @@ def build_manifest(
                 "matched_with_reread_dupes": matched_with_reread_dupes,
                 "exported": exported,
                 "skipped_existing": skipped_existing,
+                "failed_write": failed_write,
                 "missing_sig_fields_step1": missing_sig_fields,
                 "step1_signature_collision_count": len(step1_collision_sigs),
             },

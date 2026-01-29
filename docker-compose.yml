@@ -4,7 +4,13 @@ services:
     image: step-xcaf-docker:latest
     working_dir: /repo
     volumes:
+      - ./ui_server.py:/app/ui_server.py:ro
+      - ./ui:/app/ui:ro
+      - ./ui_runs:/app/ui_runs
+      # if render_thumbnails.py lives in the repo, mount repo too:
       - ./:/repo
+    env_file:
+      - .env
     environment:
       PYTHONPATH: /repo
       ANALYZE_CMD: 'python /repo/read_step_xcaf.py --with_massprops "{step}" "{out}"'
@@ -13,3 +19,43 @@ services:
       - "8080:8080"
     entrypoint: []
     command: ["python", "-m", "uvicorn", "ui_server:app", "--host", "0.0.0.0", "--port", "8080"]
+  step1_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    restart: unless-stopped
+    volumes:
+      - ./ui_runs:/app/ui_runs
+      - ./:/repo
+    env_file:
+      - .env
+    environment:
+      RUNS_DIR: /app/ui_runs
+      PYTHONPATH: /repo
+      ANALYZE_CMD: 'python /repo/read_step_xcaf.py --with_massprops "{step}" "{out}"'
+      STATUS_REL: "status.json"
+      PREFLIGHT_PACK_REL: "preflight_pack.json"
+      ORIENTATION_REL: "orientation.json"
+      ASSEMBLY_STL_REL: "assembly.stl"
+    entrypoint: []
+    command: ["python", "/repo/step1_worker.py"]
+    depends_on:
+      - ui
+  step1_1_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    volumes:
+      - ./:/repo
+      - ./ui_runs:/app/ui_runs
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo
+    entrypoint: []
+    command: ["python", "/repo/step1_1_worker.py"]
+    restart: unless-stopped
+    depends_on:
+      - step1_worker
+
+
+
+

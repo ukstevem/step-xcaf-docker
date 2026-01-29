@@ -104,6 +104,13 @@ def _is_ready_for_export(run_dir: Path, cfg: Cfg) -> bool:
 
     return True
 
+def _refresh_tree(run_dir: Path) -> None:
+    # Rebuild occ_tree.json now that assets_manifest.json has stl_path entries.
+    cmd = ["python", "/repo/build_occ_tree.py", "--run-id", run_dir.name, "--runs-root", str(run_dir.parent)]
+    _append_progress(run_dir, "Tree: refreshing occ_tree.json (post-manifest)…")
+    subprocess.run(cmd, check=True)
+    _append_progress(run_dir, "Tree: refresh done.")
+
 
 def _run_export(run_dir: Path, cfg: Cfg) -> None:
     lock_name = ".stl_export_lock"
@@ -167,6 +174,7 @@ def main() -> int:
                         continue
                     if _is_ready_for_export(run_dir, cfg):
                         _run_export(run_dir, cfg)
+                        _refresh_tree(run_dir)
         except Exception as e:
             # keep worker alive no matter what
             print(f"[step1_1_worker] warning: {e}")

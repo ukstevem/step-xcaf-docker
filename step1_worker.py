@@ -6,8 +6,9 @@ import subprocess
 import time
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ----------------------------
 # Config
@@ -41,11 +42,15 @@ PREFLIGHT_RENDER_STL_NAME = os.environ.get("PREFLIGHT_RENDER_STL_NAME", "preflig
 
 SLEEP_SEC = float(os.environ.get("WORKER_SLEEP_SEC", "2.0"))
 
+# New: occurrence tree output (Step 1)
+OCC_TREE_REL = os.environ.get("OCC_TREE_REL", "occ_tree.json")
+XCAF_INSTANCES_REL = os.environ.get("XCAF_INSTANCES_REL", "xcaf_instances.json")
+ASSETS_MANIFEST_REL = os.environ.get("ASSETS_MANIFEST_REL", "assets_manifest.json")
+
 
 # ----------------------------
 # Helpers
 # ----------------------------
-
 def _start_heartbeat(run_dir: Path, label: str, every_sec: float = 5.0) -> Tuple[threading.Event, threading.Thread]:
     """
     Background heartbeat that appends a line every `every_sec` seconds.
@@ -92,13 +97,27 @@ def _read_json_if_exists(p: Path) -> Optional[Dict[str, Any]]:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
 
+def _read_json_required(p: Path) -> Dict[str, Any]:
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to read JSON: {p} ({e})") from e
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"Invalid JSON (expected object): {p}")
+    return obj
+
+
 def _write_json(p: Path, obj: Dict[str, Any]) -> None:
-    p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    # atomic-ish write
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(p)
 
 
 def _set_status(run_dir: Path, stage: str, extra: Optional[Dict[str, Any]] = None) -> None:
@@ -141,11 +160,21 @@ def _unlock(run_dir: Path) -> None:
 
 
 def _poly_cells_count(pd) -> int:
-    # PyVista: for PolyData, triangles are cells
     try:
         return int(getattr(pd, "n_cells"))
     except Exception:
         return 0
+
+
+def _safe_str(x: Any) -> str:
+    return str(x) if x is not None else ""
+
+
+def _pick_first(*vals: Any) -> Optional[str]:
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
 
 # ----------------------------
@@ -186,11 +215,6 @@ def _write_coarse_stl_from_step(step_path: Path, stl_path: Path, deflection: flo
 # Decimate for render (optional)
 # ----------------------------
 def _make_render_stl(src_stl: Path, dst_stl: Path, run_dir: Path) -> Tuple[Path, float, str]:
-    """
-    Return (stl_to_render, mb, note).
-    If src is small enough -> use src.
-    If src is huge -> try decimate_pro into dst and use dst.
-    """
     os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
     import pyvista as pv
 
@@ -206,7 +230,6 @@ def _make_render_stl(src_stl: Path, dst_stl: Path, run_dir: Path) -> Tuple[Path,
         return src_stl, src_mb, "render: decimate skipped (no cells)"
 
     if n0 <= PREFLIGHT_RENDER_MAX_CELLS:
-        # already small in poly terms, just copy
         try:
             if dst_stl.exists():
                 dst_stl.unlink()
@@ -276,7 +299,6 @@ def _render_6faces_from_stl(stl_path: Path, run_dir: Path) -> Dict[str, str]:
     _render(lambda pl: pl.view_zx(), p_left)
     _render(lambda pl: pl.view_xz(), p_right)
 
-    # composite
     size = PREFLIGHT_IMG_SIZE
     comp = Image.new("RGB", (size * 3, size * 2), (255, 255, 255))
 
@@ -334,25 +356,25 @@ def _preflight(run_dir: Path) -> None:
     except Exception:
         pass
 
-    # Heartbeat during the heavyweight OCC mesh+write
     with _heartbeat(run_dir, "Preflight: meshing+writing STL", every_sec=5.0):
         _write_coarse_stl_from_step(step_path, stl_coarse, PREFLIGHT_STL_DEFLECTION, run_dir)
 
     coarse_mb = _mb(stl_coarse)
     _append_progress(run_dir, f"Preflight: coarse STL size={coarse_mb:.1f} MB")
 
-    # Heartbeat during decimation (can be slow on huge meshes)
     with _heartbeat(run_dir, "Preflight: preparing render mesh", every_sec=5.0):
         stl_to_render, render_mb, render_note = _make_render_stl(stl_coarse, stl_render, run_dir)
 
     _append_progress(run_dir, f"Preflight: {render_note} (render STL {render_mb:.1f} MB)")
 
-    # Heartbeat during 6-face rendering (can be slow if mesh is heavy)
     with _heartbeat(run_dir, "Preflight: rendering 6 views", every_sec=5.0):
         views = _render_6faces_from_stl(stl_to_render, run_dir)
 
     if coarse_mb > PREFLIGHT_KEEP_STL_MAX_MB:
-        _append_progress(run_dir, f"Preflight: deleting coarse STL ({coarse_mb:.1f} MB > keep cap {PREFLIGHT_KEEP_STL_MAX_MB:.1f} MB)")
+        _append_progress(
+            run_dir,
+            f"Preflight: deleting coarse STL ({coarse_mb:.1f} MB > keep cap {PREFLIGHT_KEEP_STL_MAX_MB:.1f} MB)",
+        )
         try:
             stl_coarse.unlink(missing_ok=True)
         except Exception:
@@ -417,6 +439,227 @@ def _run_pipeline(run_dir: Path) -> None:
 
 
 # ----------------------------
+# Occurrence tree (Step 1)
+# ----------------------------
+@dataclass(frozen=True)
+class _ManifestHit:
+    match_status: str
+    part_id: str
+    stl_path: Optional[str]
+    ref_def: Optional[str]
+    def_sig_used: Optional[str]
+
+
+def _norm_occurrences(xcaf: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    occs = xcaf.get("occurrences")
+    if occs is None:
+        raise RuntimeError("xcaf_instances missing 'occurrences'")
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(occs, dict):
+        for occ_id, rec in occs.items():
+            if isinstance(rec, dict):
+                oid = _safe_str(occ_id).strip()
+                if oid:
+                    out[oid] = rec
+        return out
+
+    if isinstance(occs, list):
+        for rec in occs:
+            if not isinstance(rec, dict):
+                continue
+            oid = _pick_first(rec.get("occ_id"), rec.get("id"))
+            if not oid:
+                continue
+            out[oid] = rec
+        return out
+
+    raise RuntimeError("xcaf_instances.occurrences is neither dict nor list")
+
+
+def _occ_ref_def_id(occ: Dict[str, Any]) -> Optional[str]:
+    return _pick_first(occ.get("ref_def"), occ.get("def_id"), occ.get("definition"), occ.get("ref_def_id"))
+
+
+def _def_sig(def_rec: Dict[str, Any]) -> Optional[str]:
+    return _pick_first(def_rec.get("def_sig_free"), def_rec.get("def_sig"))
+
+
+def _occ_display_name(occ: Dict[str, Any], defs: Dict[str, Any], ref_def_id: Optional[str], occ_id: str) -> str:
+    name = _pick_first(occ.get("display_name"), occ.get("name"), occ.get("label"))
+    if name:
+        return name
+    if ref_def_id and isinstance(defs.get(ref_def_id), dict):
+        dn = _pick_first(defs[ref_def_id].get("name"))
+        if dn:
+            return dn
+    return occ_id
+
+
+def _index_manifest(man: Dict[str, Any]) -> Tuple[Dict[str, List[_ManifestHit]], Dict[str, List[_ManifestHit]]]:
+    items = man.get("items")
+    by_sig: Dict[str, List[_ManifestHit]] = {}
+    by_def: Dict[str, List[_ManifestHit]] = {}
+
+    if not isinstance(items, list):
+        return by_sig, by_def
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        hit = _ManifestHit(
+            match_status=_safe_str(it.get("match_status")).strip() or "unknown",
+            part_id=_safe_str(it.get("part_id")).strip(),
+            stl_path=it.get("stl_path") if isinstance(it.get("stl_path"), str) else None,
+            ref_def=_pick_first(it.get("ref_def")),
+            def_sig_used=_pick_first(it.get("def_sig_used")),
+        )
+        if hit.def_sig_used:
+            by_sig.setdefault(hit.def_sig_used, []).append(hit)
+        if hit.ref_def:
+            by_def.setdefault(hit.ref_def, []).append(hit)
+
+    return by_sig, by_def
+
+
+def _pick_manifest_stl(
+    ref_def_sig: Optional[str],
+    ref_def_id: Optional[str],
+    by_sig: Dict[str, List[_ManifestHit]],
+    by_def: Dict[str, List[_ManifestHit]],
+) -> Optional[str]:
+    cands: List[_ManifestHit] = []
+    if ref_def_sig and ref_def_sig in by_sig:
+        cands.extend(by_sig[ref_def_sig])
+    if (not cands) and ref_def_id and ref_def_id in by_def:
+        cands.extend(by_def[ref_def_id])
+
+    if not cands:
+        return None
+
+    def _rank(status: str) -> int:
+        return 0 if status == "matched" else 10
+
+    cands_sorted = sorted(cands, key=lambda h: (_rank(h.match_status), h.part_id, _safe_str(h.stl_path)))
+    for h in cands_sorted:
+        if h.stl_path:
+            return h.stl_path
+    return None
+
+
+def _build_occ_tree(run_dir: Path) -> None:
+    """
+    Build occ_tree.json as soon as xcaf_instances.json exists.
+    Uses xcaf_instances for hierarchy; optionally uses assets_manifest to resolve stl_url.
+    """
+    xcaf_path = run_dir / XCAF_INSTANCES_REL
+    if not xcaf_path.exists():
+        raise RuntimeError(f"Missing {XCAF_INSTANCES_REL}")
+
+    xcaf = _read_json_required(xcaf_path)
+
+    defs = xcaf.get("definitions")
+    if not isinstance(defs, dict):
+        raise RuntimeError("xcaf_instances missing 'definitions' object")
+
+    occs = _norm_occurrences(xcaf)
+
+    man = _read_json_if_exists(run_dir / ASSETS_MANIFEST_REL) or {}
+    by_sig, by_def = _index_manifest(man)
+
+    # Build children map
+    children_map: Dict[str, List[str]] = {oid: [] for oid in occs.keys()}
+    parent_map: Dict[str, Optional[str]] = {oid: None for oid in occs.keys()}
+
+    has_explicit_children = any(isinstance(occs[oid].get("children"), list) for oid in occs.keys())
+
+    if has_explicit_children:
+        for oid, rec in occs.items():
+            kids = rec.get("children")
+            if not isinstance(kids, list):
+                continue
+            for k in kids:
+                kid = _safe_str(k).strip()
+                if kid and kid in occs:
+                    children_map[oid].append(kid)
+                    parent_map[kid] = oid
+    else:
+        for oid, rec in occs.items():
+            parent = _pick_first(rec.get("parent_occ_id"), rec.get("parent"))
+            if parent and parent in occs:
+                parent_map[oid] = parent
+                children_map[parent].append(oid)
+
+    # Roots (prefer xcaf.roots if present)
+    roots_raw = xcaf.get("roots")
+    roots: List[str] = []
+    if isinstance(roots_raw, list):
+        for r in roots_raw:
+            rid = _safe_str(r).strip()
+            if rid and rid in occs:
+                roots.append(rid)
+    if not roots:
+        roots = [oid for oid, p in parent_map.items() if not p]
+
+    nodes: Dict[str, Dict[str, Any]] = {}
+
+    for oid, occ in occs.items():
+        ref_def_id = _occ_ref_def_id(occ)
+        def_rec = defs.get(ref_def_id) if ref_def_id and isinstance(defs.get(ref_def_id), dict) else None
+        ref_def_sig = _def_sig(def_rec) if isinstance(def_rec, dict) else None
+
+        stl_path = _pick_manifest_stl(ref_def_sig, ref_def_id, by_sig, by_def)
+        stl_url = None
+        if stl_path and stl_path.startswith("stl/"):
+            stl_url = f"/runs/{run_dir.name}/{stl_path}"
+
+        display = _occ_display_name(occ, defs, ref_def_id, oid)
+
+        kids = children_map.get(oid, [])
+        # deterministic order
+        kids_sorted = sorted(
+            list(dict.fromkeys(kids)),
+            key=lambda k: (_occ_display_name(occs[k], defs, _occ_ref_def_id(occs[k]), k).lower(), k),
+        )
+
+        node: Dict[str, Any] = {
+            "display_name": display,
+            "children": kids_sorted,
+            "ref_def_sig": ref_def_sig,
+            "stl_url": stl_url,
+        }
+
+        if ref_def_id:
+            node["ref_def_id"] = ref_def_id
+
+        if isinstance(def_rec, dict):
+            if "qty_total" in def_rec:
+                node["qty_total"] = def_rec.get("qty_total")
+            if "shape_kind" in def_rec:
+                node["shape_kind"] = def_rec.get("shape_kind")
+            if "solid_count" in def_rec:
+                node["solid_count"] = def_rec.get("solid_count")
+            if "def_sig_algo" in def_rec:
+                node["def_sig_algo"] = def_rec.get("def_sig_algo")
+
+        nodes[oid] = node
+
+    roots_sorted = sorted(roots, key=lambda r: (nodes[r]["display_name"].lower(), r))
+
+    tree = {
+        "schema": "occ_tree.v1",
+        "run_id": run_dir.name,
+        "created_utc": _now_utc_iso(),
+        "roots": roots_sorted,
+        "nodes": nodes,
+    }
+
+    out_path = run_dir / OCC_TREE_REL
+    _write_json(out_path, tree)
+
+
+# ----------------------------
 # Main loop
 # ----------------------------
 def main() -> None:
@@ -446,6 +689,15 @@ def main() -> None:
 
                 _set_status(run_dir, "running")
                 _run_pipeline(run_dir)
+
+                # New: build occurrence tree immediately after xcaf_instances exists
+                _append_progress(run_dir, "Tree: building occ_tree.json…")
+                try:
+                    _build_occ_tree(run_dir)
+                    _append_progress(run_dir, f"Tree: done. ({OCC_TREE_REL})")
+                except Exception as e:
+                    # Don't fail the whole run if tree failed; record and continue.
+                    _append_progress(run_dir, f"Tree: WARNING: {e}")
 
                 _set_status(run_dir, "ready")
             except Exception as e:

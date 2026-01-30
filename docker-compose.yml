@@ -29,7 +29,6 @@ services:
     env_file:
       - .env
     environment:
-      RUNS_DIR: /app/ui_runs
       PYTHONPATH: /repo
       ANALYZE_CMD: 'python /repo/read_step_xcaf.py --with_massprops "{step}" "{out}"'
       STATUS_REL: "status.json"
@@ -55,6 +54,22 @@ services:
     restart: unless-stopped
     depends_on:
       - step1_worker
+  step2_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    restart: unless-stopped
+    volumes:
+      - ./ui_runs:/app/ui_runs
+      - ./:/repo
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo
+    entrypoint: []
+    command: ["python", "/repo/step2_worker.py"]
+    depends_on:
+      - step1_1_worker
+
 
 
 

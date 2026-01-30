@@ -48,7 +48,6 @@ def _pick_first(*vals: Any) -> Optional[str]:
 def _norm_occurrences(xcaf: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     occs = xcaf.get("occurrences")
     if occs is None:
-        # Some older outputs used "occurrence_index" etc. Extend here if needed.
         raise RuntimeError("xcaf_instances.json missing 'occurrences'")
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -69,7 +68,6 @@ def _norm_occurrences(xcaf: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 continue
             oid = _pick_first(rec.get("occ_id"), rec.get("id"))
             if not oid:
-                # Can't invent a stable id. Skip with warning.
                 continue
             out[oid] = rec
         return out
@@ -77,15 +75,16 @@ def _norm_occurrences(xcaf: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     raise RuntimeError("xcaf_instances.json 'occurrences' is neither dict nor list")
 
 
-def _occ_display_name(occ: Dict[str, Any], defs: Dict[str, Any], ref_def_id: Optional[str], occ_id: str) -> str:
-    name = _pick_first(occ.get("display_name"), occ.get("name"), occ.get("label"))
-    if name:
-        return name
-    if ref_def_id and isinstance(defs.get(ref_def_id), dict):
-        dn = _pick_first(defs[ref_def_id].get("name"))
-        if dn:
-            return dn
-    return occ_id
+def _split_instance_suffix(s: Optional[str]) -> tuple[str, str]:
+    if not s:
+        return "", ""
+    t = str(s).strip()
+    # Keep deterministic ":<int>" suffix if present
+    if ":" in t:
+        head, tail = t.rsplit(":", 1)
+        if tail.isdigit():
+            return head, ":" + tail
+    return t, ""
 
 
 def _occ_ref_def_id(occ: Dict[str, Any]) -> Optional[str]:
@@ -94,6 +93,50 @@ def _occ_ref_def_id(occ: Dict[str, Any]) -> Optional[str]:
 
 def _def_sig(def_rec: Dict[str, Any]) -> Optional[str]:
     return _pick_first(def_rec.get("def_sig_free"), def_rec.get("def_sig"))
+
+
+def _occ_display_fields(
+    occ: Dict[str, Any],
+    defs: Dict[str, Any],
+    ref_def_id: Optional[str],
+    occ_id: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Returns:
+      display_name  (prefer definition name + occurrence :N suffix if present)
+      occ_label     (original occurrence label, e.g. NAU01085:1)
+      def_name      (definition name, e.g. M8 Bolt)
+    """
+    # occurrence label (often part number / instance label)
+    occ_label = _pick_first(occ.get("display_name"), occ.get("name"), occ.get("label"))
+    _, suffix = _split_instance_suffix(occ_label)
+
+    def_name = None
+    if ref_def_id and isinstance(defs.get(ref_def_id), dict):
+        def_name = _pick_first(defs[ref_def_id].get("name"))
+
+    # Prefer definition name if available
+    if def_name:
+        display = def_name + suffix
+    elif occ_label:
+        display = str(occ_label).strip()
+    else:
+        display = occ_id
+
+    return (
+        display,
+        (str(occ_label).strip() if occ_label else None),
+        (str(def_name).strip() if def_name else None),
+    )
+
+
+def _occ_display_name(
+    occ: Dict[str, Any],
+    defs: Dict[str, Any],
+    ref_def_id: Optional[str],
+    occ_id: str,
+) -> str:
+    return _occ_display_fields(occ, defs, ref_def_id, occ_id)[0]
 
 
 @dataclass(frozen=True)
@@ -131,9 +174,12 @@ def _index_manifest(man: Dict[str, Any]) -> Tuple[Dict[str, List[ManifestHit]], 
     return by_sig, by_def
 
 
-def _pick_manifest_stl(ref_def_sig: Optional[str], ref_def_id: Optional[str],
-                       by_sig: Dict[str, List[ManifestHit]],
-                       by_def: Dict[str, List[ManifestHit]]) -> Optional[str]:
+def _pick_manifest_stl(
+    ref_def_sig: Optional[str],
+    ref_def_id: Optional[str],
+    by_sig: Dict[str, List[ManifestHit]],
+    by_def: Dict[str, List[ManifestHit]],
+) -> Optional[str]:
     cands: List[ManifestHit] = []
     if ref_def_sig and ref_def_sig in by_sig:
         cands.extend(by_sig[ref_def_sig])
@@ -158,6 +204,174 @@ def _pick_manifest_stl(ref_def_sig: Optional[str], ref_def_id: Optional[str],
             return h.stl_path
     return None
 
+def _group_key(n: Dict[str, Any]) -> str:
+    # stable key for grouping leaf parts
+    sig = n.get("ref_def_sig")
+    if isinstance(sig, str) and sig:
+        return "sig:" + sig
+    did = n.get("ref_def_id")
+    if isinstance(did, str) and did:
+        return "def:" + did
+    return "name:" + str(n.get("display_name") or "")
+
+
+def _make_group_id(parent_id: str, key: str) -> str:
+    # deterministic, safe group id
+    # (no hashing needed; bounded length for sanity)
+    safe = key.replace("/", "_").replace(":", "_")
+    if len(safe) > 60:
+        safe = safe[:60]
+    return f"G:{parent_id}:{safe}"
+
+
+def build_bom_global(run_id: str, tree: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = tree.get("nodes", {})
+    if not isinstance(nodes, dict):
+        nodes = {}
+
+    # Aggregate leaf occurrences by stable key
+    agg: Dict[str, Dict[str, Any]] = {}
+
+    for occ_id, n in nodes.items():
+        if not isinstance(n, dict):
+            continue
+        kids = n.get("children")
+        if isinstance(kids, list) and len(kids) > 0:
+            continue  # only leaf occurrences contribute to BOM counts
+
+        sig = n.get("ref_def_sig") if isinstance(n.get("ref_def_sig"), str) else None
+        did = n.get("ref_def_id") if isinstance(n.get("ref_def_id"), str) else None
+
+        if sig:
+            key = f"sig:{sig}"
+        elif did:
+            key = f"def:{did}"
+        else:
+            # last resort (should be rare)
+            key = f"name:{str(n.get('def_name') or n.get('display_name') or occ_id)}"
+
+        rec = agg.get(key)
+        if rec is None:
+            rec = {
+                "key": key,
+                "def_name": n.get("def_name") or n.get("display_name"),
+                "occ_label_sample": n.get("occ_label"),
+                "ref_def_sig": sig,
+                "ref_def_id": did,
+                "qty_total": 0,
+                "shape_kind": n.get("shape_kind"),
+                "solid_count": n.get("solid_count"),
+                "stl_url": n.get("stl_url"),
+            }
+            agg[key] = rec
+
+        # qty: if node has qty_total int use it, else count 1
+        rec["qty_total"] += 1
+
+
+        # prefer having an stl_url if we didn't already
+        if not rec.get("stl_url") and n.get("stl_url"):
+            rec["stl_url"] = n.get("stl_url")
+
+    items = sorted(
+        agg.values(),
+        key=lambda r: (
+            str(r.get("def_name") or "").lower(),
+            str(r.get("ref_def_sig") or ""),
+            str(r.get("ref_def_id") or ""),
+        ),
+    )
+
+    return {
+        "schema": "bom_global.v1",
+        "run_id": run_id,
+        "created_utc": _utc_iso_z(),
+        "items": items,
+    }
+
+
+
+def build_grouped_tree(full_tree: Dict[str, Any], *, member_cap: int = 50) -> Dict[str, Any]:
+    nodes = full_tree["nodes"]
+    roots = full_tree["roots"]
+
+    # Copy non-leaf nodes as-is; we'll rewrite children lists.
+    out_nodes: Dict[str, Dict[str, Any]] = {}
+    for oid, n in nodes.items():
+        out_nodes[oid] = dict(n)
+        out_nodes[oid]["children"] = list(n.get("children") or [])
+
+    def is_leaf(oid: str) -> bool:
+        c = out_nodes[oid].get("children")
+        return not isinstance(c, list) or len(c) == 0
+
+    # For every parent, group its leaf children that share a key.
+    for parent_id, parent in list(out_nodes.items()):
+        kids = parent.get("children")
+        if not isinstance(kids, list) or not kids:
+            continue
+
+        leaf_kids = [k for k in kids if k in out_nodes and is_leaf(k)]
+        if len(leaf_kids) < 2:
+            continue  # nothing to group
+
+        # Group only leaf kids; preserve non-leaf kids untouched.
+        non_leaf_kids = [k for k in kids if k not in leaf_kids]
+
+        buckets: Dict[str, List[str]] = {}
+        for k in leaf_kids:
+            key = _group_key(out_nodes[k])
+            buckets.setdefault(key, []).append(k)
+
+        grouped_children: List[str] = []
+        for key, members in sorted(buckets.items(), key=lambda kv: kv[0]):
+            if len(members) == 1:
+                grouped_children.append(members[0])
+                continue
+
+            rep = members[0]
+            rep_node = out_nodes[rep]
+
+            gid = _make_group_id(parent_id, key)
+            # deterministic representative: use rep_node + qty = sum of member qty_total if present
+            qty_sum = 0
+            for m in members:
+                q = out_nodes[m].get("qty_total")
+                if isinstance(q, int):
+                    qty_sum += q
+                else:
+                    qty_sum += 1  # fallback: count occurrences
+
+            gnode: Dict[str, Any] = {
+                "kind": "group",
+                "display_name": rep_node.get("display_name"),
+                "qty_total": qty_sum,
+                "children": [],
+                "rep_occ_id": rep,
+                "ref_def_id": rep_node.get("ref_def_id"),
+                "ref_def_sig": rep_node.get("ref_def_sig"),
+                "stl_url": rep_node.get("stl_url"),
+                "shape_kind": rep_node.get("shape_kind"),
+                "solid_count": rep_node.get("solid_count"),
+            }
+
+            # Keep a small sample for "where used" / drilldown, bounded
+            gnode["members"] = members[:member_cap]
+            gnode["member_count"] = len(members)
+
+            out_nodes[gid] = gnode
+            grouped_children.append(gid)
+
+        # final children list: non-leaf first (stable), then grouped leaf children
+        parent["children"] = sorted(non_leaf_kids) + grouped_children
+
+    return {
+        "schema": "occ_tree_grouped.v1",
+        "run_id": full_tree.get("run_id"),
+        "created_utc": _utc_iso_z(),
+        "roots": roots,
+        "nodes": out_nodes,
+    }
 
 def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
     run_dir = runs_root / run_id
@@ -222,13 +436,14 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
         if stl_path and stl_path.startswith("stl/"):
             stl_url = f"/runs/{run_id}/{stl_path}"
 
-        display = _occ_display_name(occ, defs, ref_def_id, oid)
+        display, occ_label, def_name = _occ_display_fields(occ, defs, ref_def_id, oid)
 
         # Deterministic child ordering
         kids = children_map.get(oid, [])
+        kids_dedup = list(dict.fromkeys(kids))  # stable de-dupe
         kids_sorted = sorted(
-            list(dict.fromkeys(kids)),  # de-dupe, stable
-            key=lambda k: ( _occ_display_name(occs[k], defs, _occ_ref_def_id(occs[k]), k).lower(), k),
+            kids_dedup,
+            key=lambda k: (_occ_display_name(occs[k], defs, _occ_ref_def_id(occs[k]), k).lower(), k),
         )
 
         node: Dict[str, Any] = {
@@ -238,12 +453,16 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
             "stl_url": stl_url,
         }
 
+        # Preserve original names for UI
+        if occ_label:
+            node["occ_label"] = occ_label
+        if def_name:
+            node["def_name"] = def_name
+
         # Optional metadata (safe + useful)
         if ref_def_id:
             node["ref_def_id"] = ref_def_id
         if isinstance(def_rec, dict):
-            if "qty_total" in def_rec:
-                node["qty_total"] = def_rec.get("qty_total")
             if "shape_kind" in def_rec:
                 node["shape_kind"] = def_rec.get("shape_kind")
             if "solid_count" in def_rec:
@@ -265,6 +484,12 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
 
     _write_json(out_path, tree)
     print(f"[ok] wrote: {out_path} roots={len(roots_sorted)} nodes={len(nodes)}")
+        # ALSO write grouped tree (leaf grouping)
+    grouped = build_grouped_tree(tree, member_cap=50)
+    grouped_path = run_dir / "occ_tree_grouped.json"
+    _write_json(grouped_path, grouped)
+    print(f"[ok] wrote: {grouped_path} roots={len(grouped['roots'])} nodes={len(grouped['nodes'])}")
+
     return tree
 
 
@@ -280,8 +505,17 @@ def main() -> int:
         return 2
 
     try:
-        build_occ_tree(ns.run_id, runs_root)
-        return 0
+       tree = build_occ_tree(ns.run_id, runs_root)
+
+       grouped = build_grouped_tree(tree, member_cap=50)
+       _write_json(runs_root / ns.run_id / "occ_tree_grouped.json", grouped)
+       print("[ok] wrote grouped tree")
+
+       bom = build_bom_global(ns.run_id, tree)
+       _write_json(runs_root / ns.run_id / "bom_global.json", bom)
+       print("[ok] wrote bom_global.json")
+       
+       return 0
     except Exception as e:
         print(f"[err] {e}", file=sys.stderr)
         return 1

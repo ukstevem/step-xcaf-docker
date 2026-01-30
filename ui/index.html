@@ -116,16 +116,26 @@
   <!-- Occurrence tree + STL viewer -->
   <div id="treeSection" style="display:none; border-top:1px solid #ddd;">
     <div style="display:flex; height: calc(100vh - 42px);">
-      <div id="treePane" style="width:360px; border-right:1px solid #ddd; overflow:auto; padding:10px 12px;">
-        <div class="muted" style="margin-bottom:8px;">
-          Assembly tree (click a node to load STL)
+      <div id="treePane" style="flex:0 0 360px; min-width:360px; border-right:1px solid #ddd; overflow:auto; padding:10px 12px;">
+        <div class="pvHdr" style="margin-bottom:8px;">
+          <div class="muted" id="treeTitle">Assembly (Grouped)</div>
+          <div style="display:flex; gap:8px; margin-left:auto;">
+            <button id="viewAssembly" class="btn" style="padding:4px 8px; font-size:12px;">Assembly (Grouped)</button>
+            <button id="viewBom" class="btn" style="padding:4px 8px; font-size:12px;">BOM (Global)</button>
+          </div>
         </div>
+
+        <div class="muted" style="margin-bottom:8px;" id="treeHint">
+          Click a row to load STL
+        </div>
+
         <div id="tree"></div>
+
       </div>
 
       <div style="flex:1; display:flex; flex-direction:column;">
-        <div id="viewer" style="flex:1; min-height:360px;"></div>
-        <div id="nodeMeta" style="border-top:1px solid #ddd; padding:10px 12px; height:200px; overflow:auto; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
+        <div id="viewer" style="flex:1; min-height:0; overflow:hidden;"></div>
+        <div id="nodeMeta" style="border-top:1px solid #ddd; padding:10px 12px; height:160px; overflow:auto; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
 { }
         </div>
       </div>

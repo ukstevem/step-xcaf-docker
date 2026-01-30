@@ -8,18 +8,20 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
-
+from datetime import datetime, timezone
 
 # ----------------------------
 # Config
 # ----------------------------
 ROOT_DIR = Path(__file__).resolve().parent
 UI_DIR = ROOT_DIR / "ui"
-RUNS_DIR = ROOT_DIR / "ui_runs"
+RUNS_DIR = Path(os.environ.get("RUNS_DIR", str(ROOT_DIR / "ui_runs"))).resolve()
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+EXPLODE_PLAN_REL = os.environ.get("EXPLODE_PLAN_REL", "explode_plan.json")
 
 PREFLIGHT_PACK_REL = os.environ.get("PREFLIGHT_PACK_REL", "preflight_pack.json")
 ORIENTATION_REL = os.environ.get("ORIENTATION_REL", "orientation.json")
@@ -27,7 +29,7 @@ STATUS_REL = os.environ.get("STATUS_REL", "status.json")
 
 # (Worker outputs later; Step 1 doesn't require them)
 XCAF_INSTANCES_REL = os.environ.get("XCAF_INSTANCES_REL", "xcaf_instances.json")
-OCC_TREE_REL = os.environ.get("OCC_TREE_REL", "occurrence_tree.json")
+OCC_TREE_REL = os.environ.get("OCC_TREE_REL", "occ_tree.json")
 ANALYSIS_PACK_REL = os.environ.get("ANALYSIS_PACK_REL", "analysis_pack.json")
 
 app = FastAPI(title="STEP UI Starter (Step 1)")
@@ -137,6 +139,45 @@ def _load_or_init_orientation(run_dir: Path) -> Dict[str, Any]:
     o = _default_orientation(run_dir.name)
     _write_json(p, o)
     return o
+
+
+def _load_explode_plan(run_dir: Path, run_id: str) -> Dict[str, Any]:
+    p = run_dir / EXPLODE_PLAN_REL
+    j = _read_json_if_exists(p)
+    if isinstance(j, dict):
+        # ensure required fields exist
+        j.setdefault("schema", "explode_plan_v1")
+        j.setdefault("run_id", run_id)
+        j.setdefault("items", {})
+        return j
+
+    return {
+        "schema": "explode_plan_v1",
+        "run_id": run_id,
+        "created_utc": _now_utc_iso(),
+        "modified_utc": _now_utc_iso(),
+        "items": {},  # def_sig -> record
+    }
+
+def _prefer_json(run_dir: Path, preferred_name: str, fallback_name: str) -> Path:
+    """
+    Prefer `preferred_name` if it exists, else `fallback_name`.
+    Always returns a path under run_dir.
+    """
+    p = run_dir / preferred_name
+    if p.is_file():
+        return p
+    return run_dir / fallback_name
+
+
+def _json_fileresponse(p: Path) -> FileResponse:
+    # Avoid stale UI when files are rewritten
+    return FileResponse(
+        p,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
 
 
 async def _save_upload_to(path: Path, up: UploadFile, *, chunk_size: int = 1024 * 1024) -> Tuple[int, str]:
@@ -740,3 +781,78 @@ async def preview(run_id: str, file: UploadFile = File(...)) -> Dict[str, Any]:
 
     return {"run_id": run_id, "queued": True}
 
+
+@app.get("/api/tree/{run_id}")
+def get_tree(run_id: str):
+    p = RUNS_DIR / run_id / OCC_TREE_REL
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"{OCC_TREE_REL} not found")
+    return FileResponse(p, media_type="application/json")
+
+@app.get("/api/tree_grouped/{run_id}")
+def get_tree_grouped(run_id: str):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+    # Prefer patched tree if present
+    p = _prefer_json(run_dir, "occ_tree_grouped_exploded.json", "occ_tree_grouped.json")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"{p.name} not found")
+    return _json_fileresponse(p)
+
+
+@app.get("/api/bom/{run_id}")
+def get_bom(run_id: str):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+    # Prefer patched BOM if present
+    p = _prefer_json(run_dir, "bom_global_exploded.json", "bom_global.json")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"{p.name} not found")
+    return _json_fileresponse(p)
+
+
+@app.get("/api/explode_plan/{run_id}")
+def get_explode_plan(run_id: str) -> Dict[str, Any]:
+    run_dir = _run_dir(run_id)
+    # Return empty plan if it doesn't exist (don’t 404 the UI)
+    plan = _load_explode_plan(run_dir, run_id)
+    return plan
+
+@app.post("/api/explode_plan/{run_id}")
+def post_explode_plan(run_id: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    run_dir = _run_dir(run_id)
+
+    def_sig = (payload.get("def_sig") or "").strip()
+    if not def_sig:
+        raise HTTPException(status_code=400, detail="def_sig is required")
+
+    action = (payload.get("action") or "").strip().lower()
+    if action not in ("mark", "unmark"):
+        raise HTTPException(status_code=400, detail="action must be 'mark' or 'unmark'")
+
+    def_name = payload.get("def_name")
+    solid_count = payload.get("solid_count")
+    note = payload.get("note") or ""
+
+    plan = _load_explode_plan(run_dir, run_id)
+    items = plan.get("items")
+    if not isinstance(items, dict):
+        items = {}
+        plan["items"] = items
+
+    if action == "mark":
+        items[def_sig] = {
+            "def_sig": def_sig,
+            "def_name": def_name,
+            "solid_count": solid_count,
+            "note": note,
+            "marked_utc": _now_utc_iso(),
+        }
+    else:
+        items.pop(def_sig, None)
+
+    plan["modified_utc"] = _now_utc_iso()
+    _write_json(run_dir / EXPLODE_PLAN_REL, plan)
+    return plan

@@ -90,6 +90,60 @@ function setStatus(s) {
   if (statusEl) statusEl.textContent = s || "";
 }
 
+function firstNonEmpty(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+function makeLinkCell(label, url, title) {
+  const td = document.createElement("td");
+  td.className = "cell-link";
+
+  const a = document.createElement("a");
+  a.className = "lnk";
+  a.textContent = label;
+  a.title = title || label;
+
+  if (!url) {
+    a.classList.add("missing");
+    a.href = "#";
+  } else {
+    // Most of our URLs are run-relative. If it’s already absolute, keep it.
+    const abs = url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")
+      ? url
+      : resolveRunUrl(currentRunId, url);
+
+    if (!abs) {
+      a.classList.add("missing");
+      a.href = "#";
+    } else {
+      a.href = abs;
+      a.target = "_blank";
+      a.rel = "noopener";
+    }
+  }
+
+  td.appendChild(a);
+  return td;
+}
+
+function fmtBbox(it) {
+  // Supports several likely shapes: bbox_mm.size, bbox.size, bbox_mm, bbox
+  const b = it?.bbox_mm || it?.bbox || null;
+  const sz =
+    (Array.isArray(b?.size) && b.size.length >= 3 && b.size) ||
+    (Array.isArray(b) && b.length >= 3 && b) ||
+    null;
+
+  if (!sz) return "";
+  const x = Number(sz[0]), y = Number(sz[1]), z = Number(sz[2]);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return "";
+  return `${x.toFixed(1)}×${y.toFixed(1)}×${z.toFixed(1)}`;
+}
+
 function setWarning(msg) {
   if (!warningEl) return;
   if (!msg) {
@@ -390,11 +444,20 @@ function setViewUi(view) {
   currentView = view;
 
   if (treeTitleEl) treeTitleEl.textContent = view === "bom" ? "BOM (Global)" : "Assembly (Grouped)";
-  if (treeHintEl) treeHintEl.textContent = "Click a row to load STL";
+  if (treeHintEl) {
+    treeHintEl.textContent =
+      view === "bom"
+        ? "Tick Explode where needed. Click a row to load STL."
+        : "Click a row to load STL";
+  }
+
+  const bomSearch = document.getElementById("bomSearch");
+  if (bomSearch) bomSearch.style.display = view === "bom" ? "block" : "none";
 
   if (viewAssemblyBtn) viewAssemblyBtn.disabled = view === "assembly";
   if (viewBomBtn) viewBomBtn.disabled = view === "bom";
 }
+
 
 function wireViewButtons() {
   if (viewAssemblyBtn) {
@@ -738,83 +801,134 @@ function renderBomUI() {
 
   const items = Array.isArray(bomData?.items) ? bomData.items : [];
 
-  const ul = document.createElement("ul");
-  ul.style.listStyle = "none";
-  ul.style.margin = "0";
-  ul.style.paddingLeft = "0";
+  // filter
+  const q = String(document.getElementById("bomSearch")?.value || "").trim().toLowerCase();
+  const filtered = q
+    ? items.filter((it) => String(it.part_number || it.def_name || "").toLowerCase().includes(q))
+    : items;
 
-  const frag = document.createDocumentFragment();
+  const table = document.createElement("table");
+  table.className = "bom";
 
-  for (const it of items) {
-    const defName = String(it.def_name || "item");
+  const thead = document.createElement("thead");
+  thead.innerHTML = `
+    <tr>
+      <th title="Explode decision">Explode</th>
+      <th>Part Number</th>
+      <th class="cell-right">Qty</th>
+      <th>Parent</th>
+      <th class="cell-mono">BBox (mm)</th>
+      <th>Category</th>
+      <th class="cell-right">Solids</th>
+      <th class="cell-link">STL</th>
+      <th class="cell-link">DWG</th>
+      <th class="cell-link">DXF</th>
+      <th class="cell-link">NC</th>
+      <th class="cell-link">DRILL</th>
+      <th class="cell-link">PNG</th>
+    </tr>
+  `;
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+
+  for (const it of filtered) {
+    const partNo = String(it.part_number || it.def_name || "—");
     const qty = typeof it.qty_total === "number" ? it.qty_total : null;
+    const parent = String(it.from_parent_def_name || "");
+    const category = String(it.category || "");
     const solidCount = typeof it.solid_count === "number" ? it.solid_count : null;
+
     const defSig =
       (typeof it.ref_def_sig === "string" && it.ref_def_sig) ||
       (typeof it.def_sig_used === "string" && it.def_sig_used) ||
       (typeof it.def_sig === "string" && it.def_sig) ||
       "";
 
+    const tr = document.createElement("tr");
 
-    const li = document.createElement("li");
-    li.style.margin = "4px 0";
-    li.style.display = "flex";
-    li.style.alignItems = "center";
-    li.style.gap = "8px";
-
-    // Checkbox: only active if solid_count > 1 and defSig exists
+    // explode checkbox
+    const tdExplode = document.createElement("td");
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.title = "Mark for explosion (split solids)";
     cb.disabled = !(solidCount != null && solidCount > 1) || !defSig;
-    cb.checked = isMarked(defSig);
+    cb.checked = defSig ? isMarked(defSig) : false;
 
+    // don't trigger row click when toggling checkbox
+    cb.addEventListener("click", (e) => e.stopPropagation());
     cb.onchange = async () => {
       try {
-        await toggleMark(currentRunId, defSig, defName, solidCount, cb.checked);
+        await toggleMark(currentRunId, defSig, partNo, solidCount, cb.checked);
         setStatus(cb.checked ? "Marked for explosion." : "Unmarked.");
+        // keep node meta accurate if selected
+        renderNodeMeta({ ...it, explode_marked: defSig ? isMarked(defSig) : false });
       } catch (e) {
         cb.checked = !cb.checked;
         setWarning(e?.message || String(e));
       }
     };
+    tdExplode.appendChild(cb);
 
-    // Row button
-    const btn = document.createElement("button");
-    btn.className = "nodebtn";
-    btn.style.flex = "1";
-    btn.style.display = "flex";
-    btn.style.justifyContent = "space-between";
-    btn.style.gap = "10px";
+    const tdPart = document.createElement("td");
+    tdPart.textContent = partNo;
 
-    const left = document.createElement("span");
-    left.textContent = defName;
+    const tdQty = document.createElement("td");
+    tdQty.className = "cell-right";
+    tdQty.textContent = qty != null ? String(qty) : "";
 
-    const right = document.createElement("span");
-    right.style.color = "#666";
-    right.style.fontSize = "12px";
-    const qtyTxt = qty != null ? `×${qty}` : "";
-    const scTxt = solidCount != null ? `solid_count=${solidCount}` : "";
-    const parent = it.from_parent_def_name ? ` ← ${it.from_parent_def_name}` : "";
-    const per = (typeof it.per_parent_count === "number") ? ` (per parent=${it.per_parent_count})` : "";
-    right.textContent = `${qtyTxt}${scTxt ? `  (${scTxt})` : ""}${per}${parent}`.trim();
+    const tdParent = document.createElement("td");
+    tdParent.className = "cell-muted";
+    tdParent.textContent = parent;
 
-    btn.appendChild(left);
-    btn.appendChild(right);
+    const tdBbox = document.createElement("td");
+    tdBbox.className = "cell-mono";
+    tdBbox.textContent = fmtBbox(it);
 
-    btn.onclick = async () => {
-      document.querySelectorAll(".nodebtn.selected").forEach((x) => x.classList.remove("selected"));
-      btn.classList.add("selected");
+    const tdCat = document.createElement("td");
+    tdCat.className = "cell-muted";
+    tdCat.textContent = category;
 
-      renderNodeMeta({
-        ...it,
-        explode_marked: defSig ? isMarked(defSig) : false,
-      });
+    const tdSol = document.createElement("td");
+    tdSol.className = "cell-right cell-muted";
+    tdSol.textContent = solidCount != null ? String(solidCount) : "";
+
+    const stl = firstNonEmpty(it, ["stl_url", "stl_path", "stl"]);
+    const dwg = firstNonEmpty(it, ["dwg_url", "dwg_path", "dwg"]);
+    const dxf = firstNonEmpty(it, ["dxf_url", "dxf_path", "dxf"]);
+    const nc  = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
+    const drl = firstNonEmpty(it, ["drilling_url", "drill_url", "drilling_path", "drill_path", "html_url"]);
+    const png = firstNonEmpty(it, ["png_url", "thumb_url", "thumbnail_url", "png_path", "thumb_path"]);
+
+
+    tr.appendChild(tdExplode);
+    tr.appendChild(tdPart);
+    tr.appendChild(tdQty);
+    tr.appendChild(tdParent);
+    tr.appendChild(tdBbox);
+    tr.appendChild(tdCat);
+    tr.appendChild(tdSol);
+    tr.appendChild(makeLinkCell("STL", stl, "Open STL"));
+    tr.appendChild(makeLinkCell("DWG", dwg, "Open DWG"));
+    tr.appendChild(makeLinkCell("DXF", dxf, "Open DXF"));
+    tr.appendChild(makeLinkCell("NC",  nc,  "Open NC1"));
+    tr.appendChild(makeLinkCell("DRILL", drl, "Open drilling drawing"));
+    tr.appendChild(makeLinkCell("PNG", png, "Open thumbnail image"));
+
+    tr.onclick = async () => {
+      // selection highlight
+      treeEl.querySelectorAll("tr.selected").forEach((x) => x.classList.remove("selected"));
+      tr.classList.add("selected");
+
+      renderNodeMeta({ ...it, explode_marked: defSig ? isMarked(defSig) : false });
 
       const url = it.stl_url || null;
-      if (!url) return;
+      if (!url) {
+        setStatus("No STL for this item.");
+        clearMesh();
+        return;
+      }
 
-      // ✅ IMPORTANT: make STL path absolute to this run folder
       const stlAbs = resolveRunUrl(currentRunId, url);
       if (!stlAbs) {
         setWarning("Bad STL URL for this item.");
@@ -831,16 +945,16 @@ function renderBomUI() {
       }
     };
 
-    li.appendChild(cb);
-    li.appendChild(btn);
-    frag.appendChild(li);
+    tbody.appendChild(tr);
   }
 
-  ul.appendChild(frag);
-  treeEl.appendChild(ul);
+  table.appendChild(tbody);
+  treeEl.appendChild(table);
+
   renderNodeMeta({});
   if (treeSectionEl) treeSectionEl.style.display = "block";
 }
+
 
 async function tryLoadBom(runId) {
   stopBomPolling();
@@ -942,6 +1056,13 @@ if (rotSel) {
     const rot = Number(rotSel?.value || 0);
     applyRotationCss(src, rot);
   };
+}
+
+const bomSearchEl = document.getElementById("bomSearch");
+if (bomSearchEl) {
+  bomSearchEl.addEventListener("input", () => {
+    if (currentView === "bom") renderBomUI();
+  });
 }
 
 // Boot: restore last run

@@ -37,6 +37,111 @@
     .nodebtn:hover { background:#f3f3f3; }
     .nodebtn.selected { background:#e9e9e9; }
 
+    /* --- New: make BOM table the focus --- */
+    #treeSectionWrap { display:flex; height: calc(100vh - 42px); }
+
+    #treePane {
+      flex: 1 1 auto;
+      min-width: 560px;
+      border-right: 1px solid #ddd;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      padding: 10px 12px;
+    }
+
+    #tableWrap {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    table.bom {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    table.bom thead th {
+      position: sticky;
+      top: 0;
+      background: #f7f7f7;
+      border-bottom: 1px solid #e5e5e5;
+      padding: 6px 8px;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    table.bom tbody td {
+      border-bottom: 1px solid #f0f0f0;
+      padding: 6px 8px;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    table.bom tbody tr:hover { background: #f7fbff; }
+    table.bom tbody tr.selected { background: #e9f2ff; }
+
+    .cell-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .cell-muted { color: #666; }
+    .cell-right { text-align: right; }
+
+    #bomSearch {
+      width: 180px;
+      padding: 5px 8px;
+      border: 1px solid #cfcfcf;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+
+    /* --- New: make viewer less prominent --- */
+    #rightPane {
+      flex: 0 0 420px;  /* smaller fixed column */
+      display: flex;
+      flex-direction: column;
+      min-width: 420px;
+    }
+
+    #viewer {
+      flex: 0 0 320px;  /* fixed height viewer */
+      min-height: 320px;
+      border-bottom: 1px solid #ddd;
+    }
+
+    #nodeMeta {
+      flex: 1 1 auto;   /* meta takes remaining height */
+      height: auto !important;
+      min-height: 0;
+      overflow: auto;
+    }
+
+      .lnk {
+      display: inline-block;
+      padding: 2px 6px;
+      border: 1px solid #cfd6e4;
+      border-radius: 999px;
+      font-size: 11px;
+      text-decoration: none;
+      color: #1f4fbf;
+      background: #f6f8ff;
+      line-height: 1.4;
+    }
+    .lnk:hover { background: #eef3ff; }
+    .lnk.missing {
+      color: #888;
+      border-color: #e3e3e3;
+      background: #fafafa;
+      cursor: default;
+      pointer-events: none;
+    }
+
+  /* keep link columns narrow */
+  .cell-link { width: 1%; } /* lets the browser shrink these */
+
   </style>
 </head>
 <body>
@@ -113,34 +218,38 @@
     </div>
   </div>
 
-  <!-- Occurrence tree + STL viewer -->
   <div id="treeSection" style="display:none; border-top:1px solid #ddd;">
-    <div style="display:flex; height: calc(100vh - 42px);">
-      <div id="treePane" style="flex:0 0 360px; min-width:360px; border-right:1px solid #ddd; overflow:auto; padding:10px 12px;">
-        <div class="pvHdr" style="margin-bottom:8px;">
-          <div class="muted" id="treeTitle">Assembly (Grouped)</div>
-          <div style="display:flex; gap:8px; margin-left:auto;">
-            <button id="viewAssembly" class="btn" style="padding:4px 8px; font-size:12px;">Assembly (Grouped)</button>
-            <button id="viewBom" class="btn" style="padding:4px 8px; font-size:12px;">BOM (Global)</button>
-          </div>
+  <div id="treeSectionWrap">
+    <div id="treePane">
+      <div class="pvHdr" style="margin-bottom:8px;">
+        <div class="muted" id="treeTitle">Assembly (Grouped)</div>
+
+        <input id="bomSearch" placeholder="Filter…" style="display:none;" />
+
+        <div style="display:flex; gap:8px; margin-left:auto;">
+          <button id="viewAssembly" class="btn" style="padding:4px 8px; font-size:12px;">Assembly (Grouped)</button>
+          <button id="viewBom" class="btn" style="padding:4px 8px; font-size:12px;">BOM (Global)</button>
         </div>
-
-        <div class="muted" style="margin-bottom:8px;" id="treeHint">
-          Click a row to load STL
-        </div>
-
-        <div id="tree"></div>
-
       </div>
 
-      <div style="flex:1; display:flex; flex-direction:column;">
-        <div id="viewer" style="flex:1; min-height:0; overflow:hidden;"></div>
-        <div id="nodeMeta" style="border-top:1px solid #ddd; padding:10px 12px; height:160px; overflow:auto; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
+      <div class="muted" style="margin-bottom:8px;" id="treeHint">
+        Click a row to load STL
+      </div>
+
+      <div id="tableWrap">
+        <div id="tree"></div>
+      </div>
+    </div>
+
+    <div id="rightPane">
+      <div id="viewer"></div>
+      <div id="nodeMeta" style="padding:10px 12px; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
 { }
-        </div>
       </div>
     </div>
   </div>
+</div>
+
 
 
   <script type="module" src="/ui/app.js"></script>

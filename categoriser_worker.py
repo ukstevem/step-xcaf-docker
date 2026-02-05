@@ -46,12 +46,37 @@ CATEGORIES = ("hardware", "plate", "section", "pipe", "fabrication", "bought_out
 
 CATEGORIES_JSON = "categories.json"
 PARTS_INDEX_JSON = "parts_index.json"
+CHIRAL_SENSITIVE_CATS = ("section", "pipe", "fabrication")
 
 MAX_ROWS = 200000  # hard safety cap for very large models (you said ~12k typical)
+
+
+# Chirality policy:
+# Categories where mirror variants must NOT be forced to share the same category result.
+# (Hardware/bought_out typically safe; plates often safe but can be enabled later.)
+CHIRAL_SENSITIVE_CATS = ("section", "pipe", "fabrication")
+
+# Optional: allow plates to be treated as chiral-sensitive too (future-proof)
+# Set env CAT_PLATE_CHIRAL_SENSITIVE=1 to enable.
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+PLATE_CHIRAL_SENSITIVE = _env_bool("CAT_PLATE_CHIRAL_SENSITIVE", False)
+
 
 # -----------------------------
 # Env helpers (bounded)
 # -----------------------------
+
+
 
 def _env_float(name: str, default: float, lo: float, hi: float) -> float:
     raw = os.getenv(name)
@@ -351,22 +376,48 @@ def _load_parts_index(run_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     return obj if isinstance(obj, dict) else None
 
+
+def _pidx_item_for_sig(pidx: Optional[Dict[str, Any]], sig_key: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(pidx, dict):
+        return None
+    items = pidx.get("items")
+    if not isinstance(items, dict):
+        return None
+    rec = items.get(sig_key)
+    return rec if isinstance(rec, dict) else None
+
+def _chiral_sig_for_member(pidx: Optional[Dict[str, Any]], sig_key: str) -> str:
+    rec = _pidx_item_for_sig(pidx, sig_key)
+    cs = rec.get("chiral_sig") if isinstance(rec, dict) else None
+    if isinstance(cs, str) and cs.strip():
+        return cs.strip()
+    # fallback: use member sig itself (means "no chirality data")
+    return sig_key
+
+def _member_chiral_meta(pidx: Optional[Dict[str, Any]], sig_key: str) -> Dict[str, Any]:
+    rec = _pidx_item_for_sig(pidx, sig_key)
+    if not isinstance(rec, dict):
+        return {"chiral_sig": None, "is_mirrored": None, "mirror_of": None}
+    cs = rec.get("chiral_sig")
+    im = rec.get("is_mirrored")
+    mo = rec.get("mirror_of")
+    return {
+        "chiral_sig": cs if isinstance(cs, str) else None,
+        "is_mirrored": bool(im) if isinstance(im, bool) else None,
+        "mirror_of": mo if isinstance(mo, str) else None,
+    }
+
+
 def _build_group_membership_from_bom(
     items: List[Dict[str, Any]],
     pidx: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
     """
     Returns:
-      - sig_key -> group_id
-      - group_id -> group_rec (from parts_index['groups'][group_id]) if available
-
-    Preferred mapping:
-      parts_index.json["items"][sig_key]["group_id"]
-
-    Fallback:
-      group_id = sig_key (no grouping)
+      - sig_key -> group_id   (free/common group)
+      - group_id -> group_rec (from parts_index['groups'][group_id], if present)
+    If parts_index missing/unusable, every sig is its own group (group_id = sig_key).
     """
-    # Collect unique sig keys from BOM (bounded + deterministic)
     sigs: List[str] = []
     for row in items:
         if isinstance(row, dict):
@@ -376,37 +427,45 @@ def _build_group_membership_from_bom(
     sig_to_group: Dict[str, str] = {}
     group_recs: Dict[str, Dict[str, Any]] = {}
 
-    if not isinstance(pidx, dict):
+    if not pidx or not isinstance(pidx, dict):
         for s in sigs:
             sig_to_group[s] = s
         return sig_to_group, group_recs
 
     groups = pidx.get("groups")
-    groups = groups if isinstance(groups, dict) else {}
+    if isinstance(groups, dict):
+        for gid, grec in groups.items():
+            if isinstance(gid, str) and isinstance(grec, dict):
+                group_recs[gid] = grec
 
-    pidx_items = pidx.get("items")
-    if not isinstance(pidx_items, dict):
-        # No usable membership map
+    # Prefer parts_index['items'] mapping (your parts_index.json HAS this)
+    p_items = pidx.get("items")
+    if isinstance(p_items, dict):
         for s in sigs:
+            rec = p_items.get(s)
+            if isinstance(rec, dict):
+                gid = rec.get("group_id")
+                if isinstance(gid, str) and gid.strip():
+                    sig_to_group[s] = gid.strip()
+                    continue
             sig_to_group[s] = s
         return sig_to_group, group_recs
 
-    # Map each sig -> group_id from parts_index["items"]
-    for s in sigs:
-        rec = pidx_items.get(s)
-        if isinstance(rec, dict):
-            gid = rec.get("group_id")
-            if isinstance(gid, str) and gid.strip():
-                gid = gid.strip()
-                sig_to_group[s] = gid
-                grec = groups.get(gid)
-                if isinstance(grec, dict):
-                    group_recs[gid] = grec
+    # Fallback: if only canonical_member_sig_key exists
+    if isinstance(groups, dict):
+        canon_map: Dict[str, str] = {}
+        for gid, grec in groups.items():
+            if not isinstance(gid, str) or not isinstance(grec, dict):
                 continue
+            cm = grec.get("canonical_member_sig_key")
+            if isinstance(cm, str) and cm:
+                canon_map[cm] = gid
+        for s in sigs:
+            sig_to_group[s] = canon_map.get(s, s)
+        return sig_to_group, group_recs
 
-        # fallback: treat as its own group
+    for s in sigs:
         sig_to_group[s] = s
-
     return sig_to_group, group_recs
 
 
@@ -476,53 +535,138 @@ def run_categoriser(run_dir: Path) -> Path:
     for gid in group_to_members:
         group_to_members[gid] = sorted(group_to_members[gid])
 
-    # Categorise per group using canonical representative if available
+    # Categorise per free-group (common components), but apply chirality policy:
+    # If the group's category is chirality-sensitive, split into chiral variants.
+    p_items = None
+    if isinstance(pidx, dict):
+        pi = pidx.get("items")
+        if isinstance(pi, dict):
+            p_items = pi
+
+    # Categorise per group using canonical representative if available,
+    # with optional chirality split (policy-based).
     for gid in sorted(group_to_members.keys()):
         members = group_to_members[gid]
         grec = group_recs.get(gid, {})
-        rep_sig = None
 
+        # choose representative for the free-group
         cm = grec.get("canonical_member_sig_key") if isinstance(grec, dict) else None
         if isinstance(cm, str) and cm in members:
-            rep_sig = cm
+            rep_sig_free = cm
         else:
-            rep_sig = members[0]
+            rep_sig_free = members[0]
 
-        rep_row = sig_to_row.get(rep_sig)
-        if not isinstance(rep_row, dict):
-            # should not happen, but keep safe
-            auto = CatResult("unknown", 0.40, ["missing_rep_row"])
+        rep_row_free = sig_to_row.get(rep_sig_free)
+        if not isinstance(rep_row_free, dict):
+            auto_free = CatResult("unknown", 0.40, ["missing_rep_row"])
         else:
-            pidx_items = pidx.get("items") if isinstance(pidx, dict) else None
-            auto = _categorise_row_auto(rep_row, exploded_mode, exploded_parent_sigs, pidx_items)
+            auto_free = _categorise_row_auto(rep_row_free, exploded_mode, exploded_parent_sigs)
+            auto_free = CatResult(auto_free.category, auto_free.confidence, list(auto_free.reasons) + ["grouped:true"])
 
-            # annotate reasons so you can see grouping effect
-            auto = CatResult(auto.category, auto.confidence, list(auto.reasons) + ["grouped:true"])
-
-        auto_obj = {
-            "category": auto.category,
-            "confidence": float(auto.confidence),
-            "reasons": list(auto.reasons),
-            "group_id": gid,
-            "rep_sig_key": rep_sig,
-        }
-
-        # Apply to all members (manual overrides still win per-member)
+        # Build chirality partitions (only meaningful if parts_index provides chiral_sig)
+        # chiral_sig -> list[members]
+        chiral_to_members: Dict[str, List[str]] = {}
         for s in members:
-            prev = items_out.get(s)
-            prev = prev if isinstance(prev, dict) else {}
-            manual = prev.get("manual", None)
+            cs = _chiral_sig_for_member(pidx, s)
+            chiral_to_members.setdefault(cs, []).append(s)
+        for cs in chiral_to_members:
+            chiral_to_members[cs] = sorted(chiral_to_members[cs])
 
-            if isinstance(manual, dict) and isinstance(manual.get("category"), str) and manual["category"]:
-                eff = {"category": manual["category"], "source": "manual"}
-            else:
-                eff = {"category": auto.category, "source": "auto"}
+        any_subpart = False
+        for s in members:
+            rr = sig_to_row.get(s)
+            if isinstance(rr, dict) and (rr.get("is_exploded_subpart") is True):
+                any_subpart = True
+                break
 
-            items_out[s] = {
-                "auto": auto_obj,
-                "manual": manual if manual else None,
-                "effective": eff,
+        do_split = (
+            (auto_free.category in CHIRAL_SENSITIVE_CATS)
+            and any_subpart
+            and (len(chiral_to_members) >= 2)
+        )
+
+        if not do_split:
+            # Apply one auto result to all members, but still attach per-member chirality metadata (debug/useful downstream)
+            auto_obj_base = {
+                "category": auto_free.category,
+                "confidence": float(auto_free.confidence),
+                "reasons": list(auto_free.reasons),
+                "group_id": gid,
+                "rep_sig_key": rep_sig_free,
+                "chirality_split": False,
             }
+
+            for s in members:
+                prev = items_out.get(s)
+                prev = prev if isinstance(prev, dict) else {}
+                manual = prev.get("manual", None)
+
+                if isinstance(manual, dict) and isinstance(manual.get("category"), str) and manual["category"]:
+                    eff = {"category": manual["category"], "source": "manual"}
+                else:
+                    eff = {"category": auto_free.category, "source": "auto"}
+
+                meta = _member_chiral_meta(pidx, s)
+
+                auto_obj = dict(auto_obj_base)
+                auto_obj.update(meta)
+
+                items_out[s] = {
+                    "auto": auto_obj,
+                    "manual": manual if manual else None,
+                    "effective": eff,
+                }
+            continue
+
+        # Split: compute auto per chiral subgroup (still within the same free group_id)
+        for cs in sorted(chiral_to_members.keys()):
+            sub_members = chiral_to_members[cs]
+
+            # rep for this chiral subgroup: prefer one that matches canonical member if present, else first
+            rep_sig = rep_sig_free if rep_sig_free in sub_members else sub_members[0]
+            rep_row = sig_to_row.get(rep_sig)
+
+            if not isinstance(rep_row, dict):
+                auto = CatResult("unknown", 0.40, ["missing_rep_row", "chirality_split:true"])
+            else:
+                auto_tmp = _categorise_row_auto(rep_row, exploded_mode, exploded_parent_sigs)
+                reasons = list(auto_tmp.reasons) + ["grouped:true", "chirality_split:true"]
+                auto = CatResult(auto_tmp.category, auto_tmp.confidence, reasons)
+
+            auto_obj_base = {
+                "category": auto.category,
+                "confidence": float(auto.confidence),
+                "reasons": list(auto.reasons),
+                "group_id": gid,
+                "rep_sig_key": rep_sig,
+                "chirality_split": True,
+                "chiral_sig": cs,
+            }
+
+            for s in sub_members:
+                prev = items_out.get(s)
+                prev = prev if isinstance(prev, dict) else {}
+                manual = prev.get("manual", None)
+
+                if isinstance(manual, dict) and isinstance(manual.get("category"), str) and manual["category"]:
+                    eff = {"category": manual["category"], "source": "manual"}
+                else:
+                    eff = {"category": auto.category, "source": "auto"}
+
+                meta = _member_chiral_meta(pidx, s)
+
+                auto_obj = dict(auto_obj_base)
+                # keep subgroup chiral_sig (cs) but still attach mirrored flags etc
+                auto_obj["is_mirrored"] = meta.get("is_mirrored")
+                auto_obj["mirror_of"] = meta.get("mirror_of")
+
+                items_out[s] = {
+                    "auto": auto_obj,
+                    "manual": manual if manual else None,
+                    "effective": eff,
+                }
+
+
 
     cats["items"] = items_out
     _write_json_atomic(out_path, cats)

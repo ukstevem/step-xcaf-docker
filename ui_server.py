@@ -5,13 +5,26 @@ import json
 import os
 import time
 import uuid
+
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
 from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone
+
+# Optional: categoriser worker (lazy ensure). Server still runs without it.
+try:
+    import categoriser_worker as _catw
+except Exception:
+    _catw = None
+
+# Optional: Step 3.1 parts-index worker (lazy ensure). Server still runs without it.
+try:
+    import step3_1_worker as _pidxw
+except Exception:
+    _pidxw = None
+
 
 # ----------------------------
 # Config
@@ -178,6 +191,320 @@ def _json_fileresponse(p: Path) -> FileResponse:
         headers={"Cache-Control": "no-store"},
     )
 
+
+# ----------------------------
+# Categories (lazy ensure + injection)
+# ----------------------------
+
+CATEGORIES_REL = "categories.json"
+PARTS_INDEX_REL = "parts_index.json"
+
+def _parse_utc_z(s: str) -> Optional[datetime]:
+    if not isinstance(s, str) or not s.endswith("Z"):
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _active_bom_path(run_dir: Path) -> Path:
+    p2 = run_dir / "bom_global_exploded.json"
+    if p2.is_file():
+        return p2
+    return run_dir / "bom_global.json"
+
+def _load_json_obj(p: Path) -> Dict[str, Any]:
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to read JSON: {p} ({e})") from e
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"JSON is not an object: {p}")
+    return obj
+
+def _dbg(msg: str) -> None:
+    if os.getenv("UI_DEBUG_WORKERS", "").strip() == "1":
+        print(msg, flush=True)
+
+
+PARTS_INDEX_REL = "parts_index.json"
+
+def _ensure_parts_index(run_dir: Path, bom_obj: Dict[str, Any], bom_path: Path) -> None:
+    """
+    Ensure parts_index.json exists and is fresh relative to the active BOM.
+
+    Regenerates when:
+      - output missing / invalid
+      - worker ruleset changed
+      - worker config hash changed
+      - output generated_at < bom created_utc (or bom mtime fallback)
+
+    If step3_1_worker is missing, this is a no-op.
+    """
+    if _pidxw is None:
+        return
+
+    out_path = run_dir / PARTS_INDEX_REL
+
+    # establish BOM timestamp
+    bom_dt = _parse_utc_z(str(bom_obj.get("created_utc") or ""))
+    if bom_dt is None:
+        try:
+            bom_dt = datetime.fromtimestamp(bom_path.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            bom_dt = None
+
+    def _run_now(why: str) -> None:
+        _dbg(f"[parts_index] {why} -> generating now")
+        _pidxw.run_step3_1(run_dir)
+        _dbg(f"[parts_index] done. exists={out_path.exists()} size={out_path.stat().st_size if out_path.exists() else 'NA'}")
+
+    if not out_path.exists():
+        _run_now("missing")
+        return
+
+    pidx = _read_json_if_exists(out_path)
+    if not isinstance(pidx, dict):
+        _run_now("invalid_json")
+        return
+
+    # ruleset mismatch => regenerate
+    want_ruleset = str(getattr(_pidxw, "RULESET_ID", "") or "")
+    got_ruleset = str(pidx.get("ruleset") or "")
+    if want_ruleset and got_ruleset != want_ruleset:
+        _run_now(f"ruleset_mismatch have={got_ruleset} want={want_ruleset}")
+        return
+
+    # config hash mismatch => regenerate (env/threshold changes in worker)
+    want_hash = str(getattr(_pidxw, "CONFIG_HASH", "") or "")
+    have_hash = str(pidx.get("config_hash") or "")
+    if want_hash and have_hash != want_hash:
+        _run_now(f"config_hash_mismatch have={have_hash} want={want_hash}")
+        return
+
+    gen_dt = _parse_utc_z(str(pidx.get("generated_at") or ""))
+    if gen_dt is None:
+        _run_now("missing_generated_at")
+        return
+
+    if bom_dt is not None and gen_dt < bom_dt:
+        _run_now("stale_vs_bom")
+        return
+
+
+# ----------------------------
+# Parts Index (Step 3.1) (lazy ensure + injection)
+# ----------------------------
+
+PARTS_INDEX_REL = "parts_index.json"
+
+try:
+    import step3_1_worker as _pidxw
+except Exception:
+    _pidxw = None
+
+
+def _ensure_parts_index(run_dir: Path, bom_obj: Dict[str, Any], bom_path: Path) -> None:
+    """
+    Ensure parts_index.json exists and is fresh relative to the active BOM.
+
+    If step3_1_worker is missing, this becomes a no-op.
+    """
+    if _pidxw is None:
+        return
+
+    out_path = run_dir / PARTS_INDEX_REL
+
+    bom_dt = _parse_utc_z(str(bom_obj.get("created_utc") or ""))
+    if bom_dt is None:
+        try:
+            bom_dt = datetime.fromtimestamp(bom_path.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            bom_dt = None
+
+    if not out_path.exists():
+        print("[parts_index] missing -> generating now")
+        _pidxw.run_step3_1(run_dir)
+        print(f"[parts_index] done. exists={out_path.exists()}")
+        return
+
+    pidx = _read_json_if_exists(out_path)
+    if not isinstance(pidx, dict):
+        print("[parts_index] invalid json -> regenerating")
+        _pidxw.run_step3_1(run_dir)
+        return
+
+    # ruleset mismatch => regenerate
+    want_ruleset = str(getattr(_pidxw, "RULESET_ID", "") or "")
+    got_ruleset = str(pidx.get("ruleset") or "")
+    if want_ruleset and got_ruleset != want_ruleset:
+        print("[parts_index] ruleset mismatch -> regenerating")
+        _pidxw.run_step3_1(run_dir)
+        return
+
+    # config hash mismatch => regenerate
+    want_hash = str(getattr(_pidxw, "CONFIG_HASH", "") or "")
+    have_hash = str(pidx.get("config_hash") or "")
+    if want_hash and have_hash != want_hash:
+        print("[parts_index] config hash changed -> regenerating")
+        _pidxw.run_step3_1(run_dir)
+        return
+
+    gen_dt = _parse_utc_z(str(pidx.get("generated_at") or ""))
+    if gen_dt is None:
+        print("[parts_index] missing generated_at -> regenerating")
+        _pidxw.run_step3_1(run_dir)
+        return
+
+    if bom_dt is not None and gen_dt < bom_dt:
+        print("[parts_index] BOM newer -> regenerating")
+        _pidxw.run_step3_1(run_dir)
+        return
+
+
+def _inject_parts_index_into_bom(bom_obj: Dict[str, Any], pidx_obj: Optional[Dict[str, Any]]) -> None:
+    items = bom_obj.get("items")
+    if not isinstance(items, list):
+        return
+
+    idx_items = None
+    if isinstance(pidx_obj, dict):
+        it = pidx_obj.get("items")
+        if isinstance(it, dict):
+            idx_items = it
+
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+
+        # defaults
+        row["common_key"] = None
+        row["parts_group_id"] = None
+        row["is_mirrored"] = False
+        row["mirror_of"] = None
+        row["canonical_member_sig_key"] = None
+
+        if idx_items is None:
+            continue
+
+        k = _sig_key_from_row(row)
+        rec = idx_items.get(k)
+        if not isinstance(rec, dict):
+            continue
+
+        row["common_key"] = rec.get("common_key")
+        row["parts_group_id"] = rec.get("group_id")
+        row["is_mirrored"] = bool(rec.get("is_mirrored") is True)
+        row["mirror_of"] = rec.get("mirror_of")
+        row["canonical_member_sig_key"] = rec.get("canonical_member_sig_key")
+
+
+
+def _ensure_categories(run_dir: Path, bom_obj: Dict[str, Any], bom_path: Path) -> None:
+    if _catw is None:
+        return
+
+    cat_path = run_dir / CATEGORIES_REL
+
+    bom_dt = _parse_utc_z(str(bom_obj.get("created_utc") or ""))
+    if bom_dt is None:
+        try:
+            bom_dt = datetime.fromtimestamp(bom_path.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            bom_dt = None
+
+    if not cat_path.exists():
+        _catw.run_categoriser(run_dir)
+        return
+
+    cats = _read_json_if_exists(cat_path)
+    if not isinstance(cats, dict):
+        _catw.run_categoriser(run_dir)
+        return
+
+    # ruleset mismatch => regenerate
+    want_ruleset = str(getattr(_catw, "RULESET_ID", "") or "")
+    got_ruleset = str(cats.get("ruleset") or "")
+    if want_ruleset and (got_ruleset != want_ruleset):
+        _catw.run_categoriser(run_dir)
+        return
+
+    # config hash mismatch => regenerate (env threshold changes)
+    want_hash = str(getattr(_catw, "CONFIG_HASH", "") or "")
+    have_hash = str(cats.get("config_hash") or "")
+    if want_hash and have_hash != want_hash:
+        _catw.run_categoriser(run_dir)
+        return
+
+    gen_dt = _parse_utc_z(str(cats.get("generated_at") or ""))
+    if gen_dt is None:
+        _catw.run_categoriser(run_dir)
+        return
+
+    if bom_dt is not None and gen_dt < bom_dt:
+        _catw.run_categoriser(run_dir)
+        return
+
+
+def _sig_key_from_row(row: Dict[str, Any]) -> str:
+    sig = row.get("ref_def_sig")
+    if isinstance(sig, str) and sig.strip():
+        return sig.strip()
+
+    key = row.get("key")
+    if isinstance(key, str) and key.startswith("sig:"):
+        return key[4:].strip()
+
+    ref_id = row.get("ref_def_id")
+    if isinstance(ref_id, str) and ref_id.strip():
+        return "def:" + ref_id.strip()
+
+    return "name:" + str(row.get("def_name") or "").strip().lower()
+
+def _inject_categories_into_bom(bom_obj: Dict[str, Any], cats_obj: Optional[Dict[str, Any]]) -> None:
+    items = bom_obj.get("items")
+    if not isinstance(items, list):
+        return
+
+    cat_items = None
+    if isinstance(cats_obj, dict):
+        ci = cats_obj.get("items")
+        if isinstance(ci, dict):
+            cat_items = ci
+
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+
+        row["category"] = "unknown"
+        row["category_source"] = "none"
+        row["category_confidence"] = 0.0
+
+        if cat_items is None:
+            continue
+
+        k = _sig_key_from_row(row)
+        rec = cat_items.get(k)
+        if not isinstance(rec, dict):
+            continue
+
+        eff = rec.get("effective")
+        auto = rec.get("auto")
+
+        if isinstance(eff, dict):
+            cat = eff.get("category")
+            src = eff.get("source")
+            if isinstance(cat, str) and cat:
+                row["category"] = cat
+            if isinstance(src, str) and src:
+                row["category_source"] = src
+
+        if isinstance(auto, dict):
+            conf = auto.get("confidence")
+            try:
+                row["category_confidence"] = float(conf)
+            except Exception:
+                row["category_confidence"] = 0.0
 
 
 async def _save_upload_to(path: Path, up: UploadFile, *, chunk_size: int = 1024 * 1024) -> Tuple[int, str]:
@@ -801,16 +1128,32 @@ def get_tree_grouped(run_id: str):
     return _json_fileresponse(p)
 
 
+
 @app.get("/api/bom/{run_id}")
-def get_bom(run_id: str):
+def get_bom(run_id: str) -> Dict[str, Any]:
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail="run_id not found")
-    # Prefer patched BOM if present
-    p = _prefer_json(run_dir, "bom_global_exploded.json", "bom_global.json")
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"{p.name} not found")
-    return _json_fileresponse(p)
+
+    bom_path = _active_bom_path(run_dir)
+    if not bom_path.exists():
+        raise HTTPException(status_code=404, detail="bom_global.json not found")
+
+    bom_obj = _load_json_obj(bom_path)
+
+    # Step 3.1: build/update parts index (common components + chirality)
+    _ensure_parts_index(run_dir, bom_obj, bom_path)
+
+    pidx_obj = _read_json_if_exists(run_dir / PARTS_INDEX_REL)
+    _inject_parts_index_into_bom(bom_obj, pidx_obj)
+
+    # Step 3.2+: categories (uses common_key once we update categoriser)
+    _ensure_categories(run_dir, bom_obj, bom_path)
+    cats_obj = _read_json_if_exists(run_dir / CATEGORIES_REL)
+    _inject_categories_into_bom(bom_obj, cats_obj)
+
+    bom_obj["_active_bom_name"] = bom_path.name
+    return bom_obj
 
 
 @app.get("/api/explode_plan/{run_id}")

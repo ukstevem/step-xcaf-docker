@@ -2,13 +2,14 @@
 """
 Step 5: Explode Approved Multi-Body
 
-- Reads:  out/review/multibody_decisions.json
-- Reads:  out/xcaf_instances.json (best-effort metadata, qty/name lookup)
-- Re-reads STEP via XCAF and resolves definition shapes by stable IDs (def_sig / def_sig_free)
-- Explodes approved multi-body definitions into subparts (solids)
-- Writes: out/exploded/stl/<parent_def_sig>/<subpart_id>.stl
-- Writes: out/exploded/exploded_parts.json
-- Appends: out/exploded/explode_log.jsonl
+Run-based mode (used by UI):
+- Reads:  <run_dir>/explode_plan.json
+- Reads:  <run_dir>/xcaf_instances.json
+- Reads:  <run_dir>/input.step  (or run_status.json["step_path"])
+- Writes: <run_dir>/exploded_step/<parent_def_sig>/<n>.step
+- Writes: <run_dir>/exploded_stl/<parent_def_sig>/<n>.stl
+- Writes: <run_dir>/exploded_manifest.json
+- Appends: <run_dir>/explode_worker_log.jsonl
 
 Power-of-10 style:
 - deterministic ordering
@@ -30,7 +31,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 
 
-
 # -----------------------------
 # Explicit constants / limits
 # -----------------------------
@@ -38,13 +38,11 @@ from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 MAX_APPROVED_PARENTS = 20000
 MAX_SHAPES_SCANNED = 500000
 MAX_SUBPARTS_PER_PARENT = 200000
-
-# Guardrail for in-memory JSON accumulation
 MAX_TOTAL_SUBPART_ROWS = 2000000
 
-BBOX_ROUND_MM = 3          # for deterministic sort key
+BBOX_ROUND_MM = 3          # for deterministic sort key (size only)
 VOL_ROUND_MM3 = 1          # for deterministic sort key
-MESH_DEFLECTION_MM = 0.2   # STL triangulation quality (tweak later if needed)
+MESH_DEFLECTION_MM = 0.2   # STL triangulation quality
 
 
 # -----------------------------
@@ -85,7 +83,7 @@ def _import_occ():
             "Bnd_Box": Bnd_Box,
             "BRepBndLib": BRepBndLib,
             "GProp_GProps": GProp_GProps,
-            "BRepGProp": BRepGProp,  # <-- canonical key (fixes blank volume)
+            "BRepGProp": BRepGProp,
             "BRepMesh_IncrementalMesh": BRepMesh_IncrementalMesh,
             "StlAPI_Writer": StlAPI_Writer,
             "STEPControl_Writer": STEPControl_Writer,
@@ -150,10 +148,6 @@ def _read_json(path: Path) -> dict:
 
 
 def _json_dump_atomic(path: Path, obj: Any) -> None:
-    """
-    Atomic-ish write: write to temp then replace.
-    Deterministic JSON (sort_keys=True).
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -165,9 +159,6 @@ def _json_dump_atomic(path: Path, obj: Any) -> None:
 
 
 def _sort_exploded_rows(rows: List[Dict[str, Any]]) -> None:
-    """
-    Deterministic ordering: parent_def_sig, then subpart_index, then subpart_id.
-    """
     rows.sort(
         key=lambda r: (
             str(r.get("parent_def_sig", "")),
@@ -182,21 +173,12 @@ def _sort_exploded_rows(rows: List[Dict[str, Any]]) -> None:
 # -----------------------------
 
 class SignatureAdapter:
-    """
-    Uses the project's canonical signature functions from brep_signature.py:
-
-        from brep_signature import DEF_SIG_ALGO, compute_def_sig, compute_def_sig_free
-
-    This MUST match Step 1/2 behavior.
-    """
-
     def __init__(self):
         try:
             from brep_signature import DEF_SIG_ALGO, compute_def_sig, compute_def_sig_free
         except Exception as e:
             raise RuntimeError(
                 "Failed to import required signature API from brep_signature.py.\n"
-                "Step 5 must run inside the repo-mounted container with /app on PYTHONPATH.\n"
                 "Required exports:\n"
                 "  DEF_SIG_ALGO\n"
                 "  compute_def_sig(shape)\n"
@@ -326,10 +308,33 @@ def _bbox_dims_mm(shape) -> Tuple[float, float, float]:
     return dx, dy, dz
 
 
+def _bbox_mm(shape) -> Dict[str, Any]:
+    """
+    Full-fat bbox in mm:
+      {"min":[x,y,z], "max":[x,y,z], "size":[dx,dy,dz]}
+    """
+    Bnd_Box = OCC["Bnd_Box"]
+    BRepBndLib = OCC["BRepBndLib"]
+
+    box = Bnd_Box()
+    call_maybe_s(BRepBndLib, "Add", shape, box)
+
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    dx = float(xmax - xmin)
+    dy = float(ymax - ymin)
+    dz = float(zmax - zmin)
+
+    return {
+        "min": [float(xmin), float(ymin), float(zmin)],
+        "max": [float(xmax), float(ymax), float(zmax)],
+        "size": [dx, dy, dz],
+    }
+
+
 def _volume_mm3(shape) -> Optional[float]:
     try:
         GProp_GProps = OCC["GProp_GProps"]
-        BRepGProp = OCC["BRepGProp"]  # class
+        BRepGProp = OCC["BRepGProp"]
         props = GProp_GProps()
         call_maybe_s(BRepGProp, "VolumeProperties", shape, props)
         v = float(props.Mass())
@@ -338,6 +343,7 @@ def _volume_mm3(shape) -> Optional[float]:
     except Exception:
         pass
     return None
+
 
 def _write_step(shape, out_path: Path) -> None:
     STEPControl_Writer = OCC["STEPControl_Writer"]
@@ -350,7 +356,6 @@ def _write_step(shape, out_path: Path) -> None:
     call_maybe_s(w, "Transfer", shape, STEPControl_AsIs)
     status = call_maybe_s(w, "Write", str(out_path))
 
-    # Some builds return bool, some IFSelect code, some None. Only explicit failure is fatal.
     if status is False:
         raise RuntimeError(f"Failed to write STEP: {out_path}")
     if IFSelect_RetDone is not None and isinstance(status, int) and status != IFSelect_RetDone:
@@ -368,7 +373,6 @@ def _write_stl(shape, out_path: Path) -> None:
     wr = StlAPI_Writer()
     res = wr.Write(shape, str(out_path))
 
-    # Some OCP builds return None. Treat only explicit False as failure.
     if res is False:
         raise RuntimeError(f"Failed to write STL: {out_path}")
 
@@ -378,17 +382,6 @@ def _write_stl(shape, out_path: Path) -> None:
 # -----------------------------
 
 def _load_explosion_plan_json(plan_json: Path) -> List[Dict[str, str]]:
-    """
-    Supports BOTH formats:
-
-    A) list format:
-      {"items":[{"ref_def_sig":"...", "ref_def_id":"...", "explode":true, "note":""}, ...]}
-
-    B) dict format (your UI):
-      {"items": {"<def_sig>": {"def_sig":"...", "note":"", ...}, ...}}
-
-    Returns rows: [{"ref_def_sig":..., "ref_def_id":..., "note":...}, ...]
-    """
     _require_file(plan_json, "explode_plan.json")
     data = _read_json(plan_json)
 
@@ -435,48 +428,6 @@ def _load_explosion_plan_json(plan_json: Path) -> List[Dict[str, str]]:
     raise RuntimeError(f"{plan_json} must contain 'items' as a dict or a list.")
 
 
-def _load_decisions_json(decisions_json: Path) -> List[Dict[str, str]]:
-    """
-    Expected format:
-    {
-      "decisions": {
-        "<def_sig>": {"decision": "explode|defer|...", "note": "...", "updated_utc": "..."},
-        ...
-      }
-    }
-
-    Returns a list of dicts: [{"def_sig":..., "decision":..., "note":...}, ...]
-    Deterministic ordering is handled later (we sort approved keys).
-    """
-    _require_file(decisions_json, "multibody_decisions.json")
-    with open(decisions_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    decisions = data.get("decisions")
-    if not isinstance(decisions, dict):
-        raise RuntimeError(
-            f"{decisions_json} must contain an object at key 'decisions' mapping def_sig -> record."
-        )
-
-    rows: List[Dict[str, str]] = []
-    for def_sig, rec in decisions.items():
-        if not isinstance(def_sig, str) or def_sig.strip() == "":
-            continue
-        if not isinstance(rec, dict):
-            continue
-
-        decision = str(rec.get("decision") or "").strip()
-        note = str(rec.get("note") or "").strip()
-
-        rows.append({
-            "def_sig": def_sig.strip(),
-            "decision": decision,
-            "note": note,
-            "updated_utc": str(rec.get("updated_utc") or ""),
-            })
-
-    return rows
-
 def _load_xcaf_instances_meta(xcaf_instances_json: Path) -> Dict[str, Any]:
     if not xcaf_instances_json.is_file():
         return {}
@@ -486,25 +437,14 @@ def _load_xcaf_instances_meta(xcaf_instances_json: Path) -> Dict[str, Any]:
         return {}
 
 
-def _lookup_parent_info(meta: Dict[str, Any], parent_sig: str) -> Tuple[str, int, Optional[str]]:
-    defs = meta.get("definitions")
-    if isinstance(defs, dict):
-        for _, d in defs.items():
-            if not isinstance(d, dict):
-                continue
-            if str(d.get("def_sig", "")) == parent_sig:
-                name = str(d.get("name") or d.get("def_name") or d.get("part_name") or "")
-                qty = _safe_int(d.get("qty_total") or d.get("qty") or d.get("count") or 1, 1)
-                sig_free = d.get("def_sig_free")
-                return (name, qty, str(sig_free) if sig_free else None)
+# -----------------------------
+# Logging
+# -----------------------------
 
-            if str(d.get("def_sig_free", "")) == parent_sig:
-                name = str(d.get("name") or d.get("def_name") or d.get("part_name") or "")
-                qty = _safe_int(d.get("qty_total") or d.get("qty") or d.get("count") or 1, 1)
-                sig_free = d.get("def_sig_free")
-                return (name, qty, str(sig_free) if sig_free else None)
-
-    return ("", 1, None)
+def _append_log(path: Path, rec: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 # -----------------------------
@@ -512,21 +452,6 @@ def _lookup_parent_info(meta: Dict[str, Any], parent_sig: str) -> Tuple[str, int
 # -----------------------------
 
 def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
-    """
-    Run-based exploder:
-      Reads: run_dir/<EXPLODE_PLAN_REL>
-      Reads: run_dir/xcaf_instances.json (for def_id->def_sig fallback)
-      Resolves STEP path from run_dir/run_status.json["step_path"] OR run_dir/input.step
-      Writes:
-        run_dir/exploded_step/<parent_def_sig>/<n>.step
-        run_dir/exploded_stl/<parent_def_sig>/<n>.stl
-        run_dir/exploded_manifest.json
-        run_dir/explode_worker_log.jsonl
-
-    Incremental behavior:
-      - If a parent_def_sig already exists in exploded_manifest.json AND all referenced STL files still exist,
-        we skip reprocessing that parent even if the plan file changes.
-    """
     run_dir = run_dir.resolve()
 
     plan_name = os.getenv("EXPLODE_PLAN_REL", "explode_plan.json").strip().strip('"').strip("'")
@@ -576,7 +501,7 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
     log_path = run_dir / os.getenv("WORKER_LOG_FILENAME", "explode_worker_log.jsonl")
     manifest_path = run_dir / os.getenv("EXPLODED_MANIFEST_FILENAME", "exploded_manifest.json")
 
-    # Load existing manifest (for incremental skip + merge)
+    # Load existing manifest (incremental skip + merge)
     existing_exploded: Dict[str, Any] = {}
     existing_errors: Dict[str, Any] = {}
     if manifest_path.is_file():
@@ -611,7 +536,6 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
         elif ref_id and ref_id in def_id_to_sig:
             parent_sigs.append((def_id_to_sig[ref_id], note))
 
-    # Deterministic ordering
     parent_sigs.sort(key=lambda t: (t[0], t[1]))
 
     print(f"[explode] Reading STEP: {step_path}")
@@ -637,9 +561,6 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
     errors_new: Dict[str, List[str]] = {}
 
     def _already_done(parent_def_sig: str) -> bool:
-        """
-        True if parent_def_sig exists in existing_exploded AND all referenced STL files still exist.
-        """
         recs = existing_exploded.get(parent_def_sig)
         if not isinstance(recs, list) or not recs:
             return False
@@ -654,7 +575,6 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
         return True
 
     for (parent_def_sig, note) in parent_sigs:
-        # Incremental skip: if already exploded and outputs exist, do nothing
         if _already_done(parent_def_sig):
             _append_log(
                 log_path,
@@ -698,26 +618,36 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
             )
             continue
 
-        # Build deterministic sorted list
         tmp: List[Dict[str, Any]] = []
         for sidx, solid in enumerate(solids):
             try:
                 sp_sig = sig.subpart_sig(solid)
+
+                # size for deterministic sort key
                 dx, dy, dz = _bbox_dims_mm(solid)
                 vol = _volume_mm3(solid)
+
+                # ✅ full-fat bbox for output record
+                bb = _bbox_mm(solid)
+                sz = bb.get("size") if isinstance(bb, dict) else None
+                if not (isinstance(sz, list) and len(sz) == 3):
+                    # fallback: at least write size
+                    bb = {"min": None, "max": None, "size": [float(dx), float(dy), float(dz)]}
+
                 key = (
                     str(sp_sig),
-                    round(dx, BBOX_ROUND_MM),
-                    round(dy, BBOX_ROUND_MM),
-                    round(dz, BBOX_ROUND_MM),
+                    round(float(bb["size"][0]), BBOX_ROUND_MM),
+                    round(float(bb["size"][1]), BBOX_ROUND_MM),
+                    round(float(bb["size"][2]), BBOX_ROUND_MM),
                     round(vol, VOL_ROUND_MM3) if vol is not None else -1.0,
                 )
+
                 tmp.append(
                     {
                         "solid": solid,
                         "sidx": int(sidx),
                         "subpart_sig": str(sp_sig),
-                        "bbox_mm": [float(dx), float(dy), float(dz)],
+                        "bbox_mm": bb,  # ✅ dict: min/max/size
                         "vol": (None if vol is None else float(vol)),
                         "sort_key": key,
                     }
@@ -754,13 +684,19 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
                 note_out = (note_out + "; " if note_out else "") + f"stl_write_failed:{type(e).__name__}"
                 per_err.append(f"STL write failed n={n}: {type(e).__name__}: {e}")
 
+            # ✅ full-fat bbox output
+            bb_out = rec.get("bbox_mm")
+            if not isinstance(bb_out, dict):
+                bb_out = {"min": None, "max": None, "size": None}
+
             recs.append(
                 {
                     "subpart_sig": rec["subpart_sig"],
                     "stl_url": stl_rel.replace("\\", "/"),
                     "step_relpath": step_rel.replace("\\", "/"),
                     "solid_index": int(rec["sidx"]),
-                    "bbox": {"size": rec["bbox_mm"]},
+                    "bbox_mm": bb_out,   # ✅ full-fat bbox in mm
+                    "bbox": bb_out,      # ✅ keep legacy key but now full-fat too
                     "note": (note_out or None),
                 }
             )
@@ -782,7 +718,6 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
             },
         )
 
-    # Merge manifests (keep existing parents; overwrite only parents processed this run)
     merged_exploded: Dict[str, Any] = {}
     merged_exploded.update(existing_exploded)
     merged_exploded.update(exploded_new)
@@ -804,20 +739,14 @@ def run_explosion_worker_for_run_dir(*, run_dir: Path, runs_dir: Path) -> int:
     return 0
 
 
-def _append_log(path: Path, rec: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_id", default="", help="Run folder id under RUNS_DIR (run-based explode)")
     ap.add_argument("--runs_dir", default=os.getenv("RUNS_DIR", "/app/ui_runs"))
 
-    # legacy step5 args (keep)
-    ap.add_argument("--step_path", default="", help="Legacy: STEP path (inside container)")
-    ap.add_argument("--out_dir", default="/out", help="Legacy: pipeline out directory")
+    # legacy args (kept for compatibility; not implemented here)
+    ap.add_argument("--step_path", default="", help="Legacy: STEP path (unused in this run-based script)")
+    ap.add_argument("--out_dir", default="/out", help="Legacy: pipeline out directory (unused)")
 
     ns = ap.parse_args()
 
@@ -825,6 +754,9 @@ def main() -> int:
         runs_dir = Path(ns.runs_dir)
         run_dir = runs_dir / str(ns.run_id).strip()
         return run_explosion_worker_for_run_dir(run_dir=run_dir, runs_dir=runs_dir)
+
+    print("[explode] No --run_id provided. This script is wired for run-based mode.")
+    return 2
 
 
 if __name__ == "__main__":

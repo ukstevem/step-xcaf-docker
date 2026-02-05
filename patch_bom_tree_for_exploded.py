@@ -5,13 +5,16 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-RUNS_DIR = Path(os.getenv("RUNS_DIR", "/app/ui_runs"))
+RUNS_DIR = Path(os.getenv("RUNS_DIR", "/app/ui_runs")).resolve()
 
-def _read_json(p: Path) -> dict:
+
+def _read_json(p: Path) -> Dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        obj = json.load(f)
+    return obj if isinstance(obj, dict) else {}
+
 
 def _write_json(p: Path, obj: Any) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -21,128 +24,93 @@ def _write_json(p: Path, obj: Any) -> None:
         f.write("\n")
     os.replace(tmp, p)
 
-def _subpart_counts(recs: List[Dict[str, Any]]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    for r in recs:
-        s = str(r.get("subpart_sig") or "").strip()
-        if not s:
-            continue
-        out[s] = out.get(s, 0) + 1
-    return out
 
 def _first_seen_order(recs: List[Dict[str, Any]]) -> List[str]:
-    """Return subpart_sig in first-seen order (deterministic = manifest order)."""
+    """Deterministic order: preserve exploded_manifest record order."""
     seen: Dict[str, bool] = {}
     out: List[str] = []
     for r in recs:
         if not isinstance(r, dict):
             continue
         s = str(r.get("subpart_sig") or "").strip()
-        if not s:
-            continue
-        if s in seen:
+        if not s or s in seen:
             continue
         seen[s] = True
         out.append(s)
     return out
 
 
-def _index_manifest_records(recs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Pick a representative record for each subpart_sig (first occurrence)."""
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in recs:
-        if not isinstance(r, dict):
-            continue
-        s = str(r.get("subpart_sig") or "").strip()
-        if not s:
-            continue
-        if s not in out:
-            out[s] = r
-    return out
-
-
-def _subpart_rollup(recs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _rollup_subparts(recs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Returns:
-      subpart_sig -> {
-        "count": int,
-        "stl_url": str|None,   # representative STL
-        "step_relpath": str|None,
-        "bbox_size": [x,y,z]|None
-      }
+    sub_sig -> {"count": int, "sample": dict(first seen)}
     """
     out: Dict[str, Dict[str, Any]] = {}
     for r in recs:
         if not isinstance(r, dict):
             continue
-        s = str(r.get("subpart_sig") or "").strip()
-        if not s:
+        sub = str(r.get("subpart_sig") or "").strip()
+        if not sub:
             continue
-        ent = out.get(s)
+        ent = out.get(sub)
         if ent is None:
-            ent = {"count": 0, "stl_url": None, "step_relpath": None, "bbox_size": None}
-            out[s] = ent
-        ent["count"] += 1
-
-        # pick first available representative assets
-        if ent["stl_url"] is None:
-            u = r.get("stl_url")
-            if isinstance(u, str) and u.strip():
-                ent["stl_url"] = u.strip()
-        if ent["step_relpath"] is None:
-            u = r.get("step_relpath")
-            if isinstance(u, str) and u.strip():
-                ent["step_relpath"] = u.strip()
-        if ent["bbox_size"] is None:
-            bb = r.get("bbox")
-            if isinstance(bb, dict):
-                sz = bb.get("size")
-                if isinstance(sz, list) and len(sz) == 3:
-                    ent["bbox_size"] = sz
+            out[sub] = {"count": 1, "sample": r}
+        else:
+            ent["count"] = int(ent["count"]) + 1
     return out
 
 
-def _subpart_rollup(recs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in recs:
-        if not isinstance(r, dict):
-            continue
-        s = str(r.get("subpart_sig") or "").strip()
-        if not s:
-            continue
-
-        ent = out.get(s)
-        if ent is None:
-            ent = {"count": 0, "stl_url": None, "step_relpath": None, "bbox_size": None}
-            out[s] = ent
-
-        ent["count"] += 1
-
-        if ent["stl_url"] is None:
-            u = r.get("stl_url")
-            if isinstance(u, str) and u.strip():
-                ent["stl_url"] = u.strip()
-
-        if ent["step_relpath"] is None:
-            u = r.get("step_relpath")
-            if isinstance(u, str) and u.strip():
-                ent["step_relpath"] = u.strip()
-
-        if ent["bbox_size"] is None:
-            bb = r.get("bbox")
-            if isinstance(bb, dict):
-                sz = bb.get("size")
-                if isinstance(sz, list) and len(sz) == 3:
-                    ent["bbox_size"] = sz
-
-    return out
+def _to_run_url(run_id: str, maybe_rel: Any) -> Optional[str]:
+    """
+    Match bom_global.json stl_url style:
+      - if already absolute (/runs/... or http...), keep
+      - else prefix /runs/<run_id>/
+    """
+    if not isinstance(maybe_rel, str):
+        return None
+    s = maybe_rel.strip()
+    if not s:
+        return None
+    if s.startswith("http://") or s.startswith("https://") or s.startswith("/"):
+        return s
+    return f"/runs/{run_id}/{s.lstrip('./')}"
 
 
-def patch_bom(bom: Dict[str, Any], exploded: Dict[str, Any]) -> Dict[str, Any]:
+def _bbox_mm_from_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Prefer full-fat bbox_mm (min/max/size).
+    Fallback to bbox with min/max/size.
+    Final fallback: bbox with size only.
+    """
+    # full-fat
+    for k in ("bbox_mm", "bbox"):
+        bb = sample.get(k)
+        if isinstance(bb, dict):
+            mn = bb.get("min")
+            mx = bb.get("max")
+            sz = bb.get("size")
+            if isinstance(mn, list) and isinstance(mx, list) and isinstance(sz, list):
+                if len(mn) == 3 and len(mx) == 3 and len(sz) == 3:
+                    return {
+                        "min": [float(mn[0]), float(mn[1]), float(mn[2])],
+                        "max": [float(mx[0]), float(mx[1]), float(mx[2])],
+                        "size": [float(sz[0]), float(sz[1]), float(sz[2])],
+                    }
+
+    # size-only (if that's all you have)
+    bb = sample.get("bbox")
+    if isinstance(bb, dict):
+        sz = bb.get("size")
+        if isinstance(sz, list) and len(sz) == 3:
+            return {"size": [float(sz[0]), float(sz[1]), float(sz[2])]}
+    return None
+
+
+def patch_bom(bom: Dict[str, Any], exploded: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     items = bom.get("items")
     if not isinstance(items, list):
-        bom["_explode_patch_note"] = "bom.items not a list; left unchanged"
-        return bom
+        out = dict(bom)
+        out["_explode_patch_note"] = "bom.items not a list; left unchanged"
+        return out
 
     new_items: List[Dict[str, Any]] = []
 
@@ -150,60 +118,71 @@ def patch_bom(bom: Dict[str, Any], exploded: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(row, dict):
             continue
 
-        parent_sig = str(
-            row.get("ref_def_sig") or row.get("def_sig_used") or row.get("def_sig") or ""
-        ).strip()
+        # 1) Keep original row unchanged (full-fat)
+        new_items.append(row)
 
-        if not parent_sig or parent_sig not in exploded:
-            new_items.append(row)
+        # 2) If this row has exploded subparts, append full-fat subpart rows
+        parent_sig = str(row.get("ref_def_sig") or "").strip()
+        if not parent_sig:
             continue
 
-        parent_name = str(row.get("def_name") or row.get("name") or "").strip() or "Parent"
-        qty_parent = int(row.get("qty_total") or row.get("qty") or 1)
-
-        recs = exploded.get(parent_sig)
-        if not isinstance(recs, list) or not recs:
-            new_items.append(row)
+        recs_any = exploded.get(parent_sig)
+        recs = recs_any if isinstance(recs_any, list) else []
+        if not recs:
             continue
 
-        roll = _subpart_rollup(recs)
+        roll = _rollup_subparts(recs)
+        qty_parent = int(row.get("qty_total") or 1)
+        parent_name = str(row.get("def_name") or "item")
 
-        # Replace parent with rolled-up subparts (BOM view)
-        for sub_sig in sorted(roll.keys()):
-            ent = roll[sub_sig]
-            per_parent_count = int(ent.get("count") or 0)
-            if per_parent_count <= 0:
+        # Deterministic subpart order
+        ordered_subs = _first_seen_order(recs)
+
+        for sub_sig in ordered_subs:
+            ent = roll.get(sub_sig)
+            if ent is None:
                 continue
 
-            sub_short = sub_sig[:10]
-            def_name = f"{parent_name} :: subpart {sub_short}"
+            per_parent = int(ent["count"])
+            sample = ent.get("sample")
+            sample = sample if isinstance(sample, dict) else {}
 
-            new_items.append({
-                "kind": "exploded_subpart",
-                "def_name": def_name,
-                "qty_total": qty_parent * per_parent_count,
-                "solid_count": 1,                 # subparts are single solids
-                "ref_def_sig": sub_sig,           # UI identity for this row
-                "stl_url": ent.get("stl_url"),    # <- makes selection load mesh
-                "step_relpath": ent.get("step_relpath"),
-                "bbox_mm": {"size": ent.get("bbox_size")} if ent.get("bbox_size") else None,
-                "from_parent_def_sig": parent_sig,
-                "from_parent_def_name": parent_name,
-                "per_parent_count": per_parent_count,
-                "parent_qty": qty_parent,
-            })
+            # Clone parent row so the schema matches "full fat"
+            nr = dict(row)
+
+            # Overwrite only what's required for the subpart identity
+            nr["def_name"] = f"{parent_name} :: subpart {sub_sig[:8]}"
+            nr["key"] = f"sig:{sub_sig}"
+            nr["ref_def_sig"] = sub_sig
+            nr["ref_def_id"] = None
+            nr["shape_kind"] = "SOLID"
+            nr["solid_count"] = 1
+            nr["qty_total"] = qty_parent * per_parent
+
+            # Carry bbox + stl_url from exploded manifest sample
+            nr["bbox_mm"] = _bbox_mm_from_sample(sample)
+            nr["stl_url"] = _to_run_url(run_id, sample.get("stl_url"))
+
+            # Extra traceability fields (safe additions)
+            nr["from_parent_def_sig"] = parent_sig
+            nr["from_parent_def_name"] = parent_name
+            nr["per_parent_count"] = per_parent
+            nr["is_exploded_subpart"] = True
+
+            new_items.append(nr)
 
     out = dict(bom)
     out["items"] = new_items
-    out["_explode_patch"] = "bom_exploded_patch_v2"
+    out["_explode_patch"] = "bom_exploded_patch_fullfat_v1"
     return out
 
 
 def patch_tree(tree: Dict[str, Any], exploded: Dict[str, Any]) -> Dict[str, Any]:
     nodes = tree.get("nodes")
     if not isinstance(nodes, dict):
-        tree["_explode_patch_note"] = "tree.nodes not a dict; left unchanged"
-        return tree
+        out = dict(tree)
+        out["_explode_patch_note"] = "tree.nodes not a dict; left unchanged"
+        return out
 
     out_nodes: Dict[str, Any] = {}
 
@@ -212,25 +191,19 @@ def patch_tree(tree: Dict[str, Any], exploded: Dict[str, Any]) -> Dict[str, Any]
             out_nodes[nid] = node
             continue
 
-        ref = str(
-            node.get("ref_def_sig") or node.get("def_sig_used") or node.get("def_sig") or ""
-        ).strip()
-
+        ref = str(node.get("ref_def_sig") or node.get("def_sig_used") or node.get("def_sig") or "").strip()
         if ref and ref in exploded:
             recs_any = exploded.get(ref)
             recs = recs_any if isinstance(recs_any, list) else []
-            sigs_in_order = _first_seen_order(recs)
-
             nn = dict(node)
-            # keep deterministic manifest order, don’t uniq/sort beyond first-seen
-            nn["exploded_subparts"] = sigs_in_order
+            nn["exploded_subparts"] = _first_seen_order(recs)
             out_nodes[nid] = nn
         else:
             out_nodes[nid] = node
 
     out = dict(tree)
     out["nodes"] = out_nodes
-    out["_explode_patch"] = "occ_tree_exploded_patch_v2"
+    out["_explode_patch"] = "occ_tree_exploded_patch_fullfat_v1"
     return out
 
 
@@ -240,6 +213,7 @@ def main() -> int:
     ns = ap.parse_args()
 
     run_dir = (RUNS_DIR / ns.run_id).resolve()
+
     man = _read_json(run_dir / "exploded_manifest.json")
     exploded = man.get("exploded") if isinstance(man, dict) else {}
     if not isinstance(exploded, dict):
@@ -249,7 +223,7 @@ def main() -> int:
     tree_path = run_dir / "occ_tree_grouped.json"
 
     if bom_path.is_file():
-        bom2 = patch_bom(_read_json(bom_path), exploded)
+        bom2 = patch_bom(_read_json(bom_path), exploded, run_id=ns.run_id)
         _write_json(run_dir / "bom_global_exploded.json", bom2)
 
     if tree_path.is_file():
@@ -258,6 +232,7 @@ def main() -> int:
 
     print("[patch] done")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

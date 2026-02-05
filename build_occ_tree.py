@@ -262,8 +262,12 @@ def build_bom_global(run_id: str, tree: Dict[str, Any]) -> Dict[str, Any]:
                 "shape_kind": n.get("shape_kind"),
                 "solid_count": n.get("solid_count"),
                 "stl_url": n.get("stl_url"),
+                "bbox_mm": n.get("bbox_mm"),
             }
             agg[key] = rec
+
+        if not rec.get("bbox_mm") and n.get("bbox_mm"):
+            rec["bbox_mm"] = n.get("bbox_mm")
 
         # qty: if node has qty_total int use it, else count 1
         rec["qty_total"] += 1
@@ -469,6 +473,9 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
                 node["solid_count"] = def_rec.get("solid_count")
             if "def_sig_algo" in def_rec:
                 node["def_sig_algo"] = def_rec.get("def_sig_algo")
+            bb = def_rec.get("bbox")
+            if isinstance(bb, dict):
+                node["bbox_mm"] = bb
 
         nodes[oid] = node
 

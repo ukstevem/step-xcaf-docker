@@ -39,6 +39,8 @@ services:
     command: ["python", "/repo/step1_worker.py"]
     depends_on:
       - ui
+
+
   step1_1_worker:
     image: step-xcaf-docker:latest
     working_dir: /repo
@@ -54,6 +56,8 @@ services:
     restart: unless-stopped
     depends_on:
       - step1_worker
+
+
   step2_worker:
     image: step-xcaf-docker:latest
     working_dir: /repo
@@ -70,6 +74,55 @@ services:
     depends_on:
       - step1_1_worker
 
+
+  step3_1_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    restart: unless-stopped
+    volumes:
+      - ./ui_runs:/app/ui_runs
+      - ./:/repo
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo
+    entrypoint: []
+    command: ["python", "/repo/step3_1_worker.py"]
+    depends_on:
+      - step2_worker
+
+  step3_2_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    restart: unless-stopped
+    volumes:
+      - ./ui_runs:/app/ui_runs
+      - ./:/repo
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo
+    entrypoint: []
+    command: ["python", "/repo/categoriser_worker.py"]
+    depends_on:
+      - step3_1_worker
+
+
+  step4_1_worker:
+    image: step-xcaf-docker:latest
+    working_dir: /repo
+    restart: unless-stopped
+    volumes:
+      - ./ui_runs:/app/ui_runs
+      - ./:/repo
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo
+    entrypoint: []
+    command: ["python", "/repo/step4_1_worker.py"]
+    depends_on:
+      - step3_2_worker
 
 
 

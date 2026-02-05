@@ -45,6 +45,8 @@ XCAF_INSTANCES_REL = os.environ.get("XCAF_INSTANCES_REL", "xcaf_instances.json")
 OCC_TREE_REL = os.environ.get("OCC_TREE_REL", "occ_tree.json")
 ANALYSIS_PACK_REL = os.environ.get("ANALYSIS_PACK_REL", "analysis_pack.json")
 
+BOM_FLAT_REL = os.environ.get("BOM_FLAT_REL", "bom_flat.json")
+
 app = FastAPI(title="STEP UI Starter (Step 1)")
 
 # Serve UI static
@@ -1199,3 +1201,16 @@ def post_explode_plan(run_id: str, payload: Dict[str, Any] = Body(...)) -> Dict[
     plan["modified_utc"] = _now_utc_iso()
     _write_json(run_dir / EXPLODE_PLAN_REL, plan)
     return plan
+
+@app.get("/api/bom_flat/{run_id}")
+def get_bom_flat(run_id: str):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    rel = os.getenv("BOM_FLAT_REL", "bom_flat.json")
+    p = run_dir / rel
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"{rel} not found")
+
+    return FileResponse(p, media_type="application/json")

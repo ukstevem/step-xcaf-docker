@@ -22,6 +22,9 @@ const viewBomBtn = document.getElementById("viewBom");
 const treeEl = document.getElementById("tree");
 const viewerEl = document.getElementById("viewer");
 const nodeMetaEl = document.getElementById("nodeMeta");
+const btnBomViewer = document.getElementById("btnBomViewer");
+const btnBomPurchasing = document.getElementById("btnBomPurchasing");
+
 
 // 6-face images (required in index.html)
 const imgTop = document.getElementById("pv_top");
@@ -62,11 +65,12 @@ let currentOrientation = { plan_source: "top", rotation_deg: 0 };
 let progressES = null;
 let statePollTimer = null;
 
-let currentView = "assembly"; // "assembly" | "bom"
+let currentView = "bom"; // "assembly" | "bom" | "bom_flat"
 let treeData = null;
 let bomData = null;
 let treePollTimer = null;
 let bomPollTimer = null;
+let bomFlatData = null;
 
 // explode plan (server-backed)
 let explodePlan = { schema: "explode_plan.v1", run_id: null, items: {} };
@@ -328,6 +332,14 @@ async function fetchBom(runId) {
   return await res.json();
 }
 
+async function fetchBomFlat(runId) {
+  const res = await fetch(`/api/bom_flat/${encodeURIComponent(runId)}`);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`bom_flat fetch failed: ${res.status} ${txt}`);
+  }
+  return await res.json();
+}
 async function fetchExplodePlan(runId) {
   const res = await fetch(`/api/explode_plan/${encodeURIComponent(runId)}`, { cache: "no-store" });
   if (!res.ok) throw new Error(await res.text());
@@ -443,20 +455,34 @@ function wireFaceClicks() {
 function setViewUi(view) {
   currentView = view;
 
-  if (treeTitleEl) treeTitleEl.textContent = view === "bom" ? "BOM (Global)" : "Assembly (Grouped)";
+  const isBom = (view === "bom" || view === "bom_flat");
+
+  if (treeTitleEl) {
+    treeTitleEl.textContent =
+      view === "bom_flat" ? "Purchasing BOM" :
+      view === "bom" ? "BOM (Global)" :
+      "Assembly (Grouped)";
+  }
+
   if (treeHintEl) {
     treeHintEl.textContent =
       view === "bom"
         ? "Tick Explode where needed. Click a row to load STL."
-        : "Click a row to load STL";
+        : isBom
+          ? "Purchasing view. Click a row to load STL."
+          : "Click a row to load STL";
   }
 
   const bomSearch = document.getElementById("bomSearch");
-  if (bomSearch) bomSearch.style.display = view === "bom" ? "block" : "none";
+  if (bomSearch) bomSearch.style.display = isBom ? "block" : "none";
 
   if (viewAssemblyBtn) viewAssemblyBtn.disabled = view === "assembly";
-  if (viewBomBtn) viewBomBtn.disabled = view === "bom";
+  if (viewBomBtn) viewBomBtn.disabled = isBom; // disable BOM (Global) button if any BOM view is active
+
+  if (btnBomViewer) btnBomViewer.disabled = view === "bom";
+  if (btnBomPurchasing) btnBomPurchasing.disabled = view === "bom_flat";
 }
+
 
 
 function wireViewButtons() {
@@ -476,6 +502,25 @@ function wireViewButtons() {
   }
 }
 
+function wireBomModeButtons() {
+  if (btnBomViewer) {
+    btnBomViewer.onclick = async () => {
+      if (!currentRunId) return;
+      setViewUi("bom");
+      await loadViewForRun(currentRunId, "bom");
+    };
+  }
+
+  if (btnBomPurchasing) {
+    btnBomPurchasing.onclick = async () => {
+      if (!currentRunId) return;
+      setViewUi("bom_flat");
+      await loadViewForRun(currentRunId, "bom_flat");
+    };
+  }
+}
+
+
 async function loadViewForRun(runId, view) {
   // always refresh explode plan (cheap + keeps checkboxes accurate)
   try {
@@ -487,11 +532,20 @@ async function loadViewForRun(runId, view) {
   if (view === "bom") {
     stopTreePolling();
     await tryLoadBom(runId);
-  } else {
-    stopBomPolling();
-    await tryLoadTree(runId);
+    return;
   }
+
+  if (view === "bom_flat") {
+    stopTreePolling();
+    await tryLoadBomFlat(runId);
+    return;
+  }
+
+  // assembly
+  stopBomPolling();
+  await tryLoadTree(runId);
 }
+
 
 // ------------------------------
 // explode plan helpers
@@ -955,6 +1009,137 @@ function renderBomUI() {
   if (treeSectionEl) treeSectionEl.style.display = "block";
 }
 
+function fmtBboxSorted(it) {
+  const s = it?.bbox_sorted_mm;
+  if (!Array.isArray(s) || s.length < 3) return "";
+  const a = Number(s[0]), b = Number(s[1]), c = Number(s[2]);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return "";
+  return `${a.toFixed(1)}×${b.toFixed(1)}×${c.toFixed(1)}`;
+}
+
+function renderBomFlatUI() {
+  if (!treeEl) return;
+  treeEl.innerHTML = "";
+
+  const items = Array.isArray(bomData?.items) ? bomData.items : [];
+
+  // filter
+  const q = String(document.getElementById("bomSearch")?.value || "").trim().toLowerCase();
+  const filtered = q
+    ? items.filter((it) => String(it.example_def_name || it.common_part_id || "").toLowerCase().includes(q))
+    : items;
+
+  const table = document.createElement("table");
+  table.className = "bom";
+
+  const thead = document.createElement("thead");
+  thead.innerHTML = `
+    <tr>
+      <th>Part</th>
+      <th class="cell-right">Qty</th>
+      <th>Category</th>
+      <th class="cell-mono">BBox (mm)</th>
+      <th class="cell-mono">Group</th>
+      <th class="cell-right">Members</th>
+      <th class="cell-link">STL</th>
+      <th class="cell-link">DWG</th>
+      <th class="cell-link">DXF</th>
+      <th class="cell-link">NC</th>
+      <th class="cell-link">DRILL</th>
+      <th class="cell-link">PNG</th>
+    </tr>
+  `;
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+
+  for (const it of filtered) {
+    const tr = document.createElement("tr");
+
+    const tdPart = document.createElement("td");
+    tdPart.textContent = String(it.example_def_name || "—");
+
+    const tdQty = document.createElement("td");
+    tdQty.className = "cell-right";
+    tdQty.textContent = (typeof it.qty === "number") ? String(it.qty) : "";
+
+    const tdCat = document.createElement("td");
+    tdCat.className = "cell-muted";
+    tdCat.textContent = String(it.category || "");
+
+    const tdBbox = document.createElement("td");
+    tdBbox.className = "cell-mono";
+    tdBbox.textContent = fmtBboxSorted(it);
+
+    const tdGroup = document.createElement("td");
+    tdGroup.className = "cell-mono cell-muted";
+    tdGroup.textContent = String(it.common_part_id || "");
+
+    const tdMembers = document.createElement("td");
+    tdMembers.className = "cell-right cell-muted";
+    tdMembers.textContent = (typeof it.members_count === "number") ? String(it.members_count) : "";
+
+    // representative STL + future link columns (same pattern as global BOM)
+    const stl = firstNonEmpty(it, ["representative_stl_url", "stl_url", "stl_path", "stl"]);
+    const dwg = firstNonEmpty(it, ["dwg_url", "dwg_path", "dwg"]);
+    const dxf = firstNonEmpty(it, ["dxf_url", "dxf_path", "dxf"]);
+    const nc  = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
+    const drl = firstNonEmpty(it, ["drilling_url", "drill_url", "drilling_path", "drill_path", "html_url"]);
+    const png = firstNonEmpty(it, ["png_url", "thumb_url", "thumbnail_url", "png_path", "thumb_path"]);
+
+    tr.appendChild(tdPart);
+    tr.appendChild(tdQty);
+    tr.appendChild(tdCat);
+    tr.appendChild(tdBbox);
+    tr.appendChild(tdGroup);
+    tr.appendChild(tdMembers);
+
+    tr.appendChild(makeLinkCell("STL", stl, "Open representative STL"));
+    tr.appendChild(makeLinkCell("DWG", dwg, "Open DWG"));
+    tr.appendChild(makeLinkCell("DXF", dxf, "Open DXF"));
+    tr.appendChild(makeLinkCell("NC",  nc,  "Open NC1"));
+    tr.appendChild(makeLinkCell("DRILL", drl, "Open drilling drawing"));
+    tr.appendChild(makeLinkCell("PNG", png, "Open thumbnail image"));
+
+    tr.onclick = async () => {
+      treeEl.querySelectorAll("tr.selected").forEach((x) => x.classList.remove("selected"));
+      tr.classList.add("selected");
+
+      renderNodeMeta(it);
+
+      const url = it.representative_stl_url || null;
+      if (!url) {
+        setStatus("No STL for this item.");
+        clearMesh();
+        return;
+      }
+
+      const stlAbs = resolveRunUrl(currentRunId, url);
+      if (!stlAbs) {
+        setWarning("Bad STL URL for this item.");
+        return;
+      }
+
+      try {
+        setStatus("Loading STL…");
+        await loadSTL(stlAbs);
+        setStatus("");
+      } catch (e) {
+        console.error(e);
+        setWarning("Failed to load STL.");
+      }
+    };
+
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  treeEl.appendChild(table);
+
+  renderNodeMeta({});
+  if (treeSectionEl) treeSectionEl.style.display = "block";
+}
+
 
 async function tryLoadBom(runId) {
   stopBomPolling();
@@ -985,6 +1170,7 @@ async function tryLoadBom(runId) {
 // ------------------------------
 wireFaceClicks();
 wireViewButtons();
+wireBomModeButtons();
 
 if (fileInp) {
   fileInp.addEventListener("change", () => {
@@ -1062,6 +1248,8 @@ const bomSearchEl = document.getElementById("bomSearch");
 if (bomSearchEl) {
   bomSearchEl.addEventListener("input", () => {
     if (currentView === "bom") renderBomUI();
+    if (currentView === "bom_flat") renderBomFlatUI();
+
   });
 }
 

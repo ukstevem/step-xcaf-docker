@@ -34,6 +34,8 @@ MAX_WHERE_USED_PER_ROW = int(os.getenv("BOM_FLAT_MAX_WHERE_USED_PER_ROW", "40"))
 
 MIN_INPUT_AGE_SEC = float(os.getenv("BOM_FLAT_MIN_INPUT_AGE_SEC", "0.25"))
 
+PARTNO_PREFIX = os.getenv("BOM_FLAT_PARTNO_PREFIX", "PSS-")
+
 SCHEMA_OUT = "bom_flat.v1"
 
 
@@ -156,6 +158,24 @@ def _extract_free_from_common(common_key: str) -> Optional[str]:
 # Category helpers
 # -----------------------------
 
+def _cat_code(cat: str) -> str:
+    c = (cat or "").strip().lower()
+    return {
+        "plate": "PL",
+        "section": "SE",
+        "pipe": "PI",
+        "hardware": "HW",
+        "bought_out": "BO",
+        "fabrication": "FB",
+        "unknown": "UN",
+    }.get(c, "UN")
+
+
+def _fmt_part_no(prefix: str, cat: str, n: int) -> str:
+    # PSS-PL-0001
+    return f"{prefix}{_cat_code(cat)}-{n:04d}"
+
+
 def _cat_info(categories: Dict[str, Any], sig_key: str) -> Tuple[str, Optional[str], bool, Optional[float]]:
     it = (categories.get("items") or {}).get(sig_key)
     if not isinstance(it, dict):
@@ -231,6 +251,18 @@ def _canonical_rep_sig_for_group(group_key: str, parts_index: Dict[str, Any], me
 # Core build
 # -----------------------------
 
+def _stable_part_number(common_part_id: str) -> str:
+    """
+    Deterministic human-readable part number.
+    Example: PSS-4F9A1C
+    - Stable across runs as long as common_part_id stays stable.
+    - Short enough for drawings / purchase lists.
+    """
+    s = str(common_part_id or "").encode("utf-8")
+    h = hashlib.sha1(s).hexdigest().upper()  # deterministic
+    return f"PSS-{h[:6]}"
+
+
 def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories: Dict[str, Any]) -> Dict[str, Any]:
     items = bom.get("items")
     if not isinstance(items, list):
@@ -238,7 +270,6 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
     if len(items) > MAX_BOM_ROWS:
         raise RuntimeError(f"bom_global_exploded.json: too many rows ({len(items)} > {MAX_BOM_ROWS})")
 
-    # Robust exploded-parent detection:
     # Any row with from_parent_def_sig is a subpart row => its parent must be suppressed.
     exploded_parent_sigs: Dict[str, int] = {}
     for r in items:
@@ -272,8 +303,10 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
 
         flattened.append(r)
 
-    # Bucket
+    # Bucket by group key, and ALSO compute where_used quantities per parent from BOM rows
     buckets: Dict[str, Dict[str, Any]] = {}
+    where_used_qty: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}  # gk -> {(parent_sig,parent_name): rec}
+
     for r in flattened:
         sig = str(r["ref_def_sig"])
         gk = _group_key_for_sig(sig, parts_index, categories)
@@ -283,7 +316,11 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
             b = {"qty": 0, "member_sigs": set(), "example_names": set(), "sample_rows": []}
             buckets[gk] = b
 
-        b["qty"] += _safe_int(r.get("qty_total"), 0)
+        qty_row = _safe_int(r.get("qty_total"), 0)
+        if qty_row <= 0:
+            qty_row = 1
+
+        b["qty"] += qty_row
         b["member_sigs"].add(sig)
 
         dn = r.get("def_name")
@@ -292,6 +329,34 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
 
         if len(b["sample_rows"]) < 3:
             b["sample_rows"].append(r)
+
+        # where_used aggregation (per parent occurrence group)
+        p_sig = r.get("from_parent_def_sig")
+        if isinstance(p_sig, str) and p_sig:
+            p_name = r.get("from_parent_def_name")
+            p_name_s = str(p_name) if isinstance(p_name, str) and p_name else ""
+            key = (p_sig, p_name_s)
+
+            wu_g = where_used_qty.get(gk)
+            if wu_g is None:
+                wu_g = {}
+                where_used_qty[gk] = wu_g
+
+            rec = wu_g.get(key)
+            if rec is None:
+                rec = {
+                    "from_parent_def_sig": p_sig,
+                    "from_parent_def_name": p_name_s or None,
+                    "qty_in_parent": 0,
+                    "occ_label_sample": None,
+                }
+                wu_g[key] = rec
+
+            rec["qty_in_parent"] += qty_row
+            if rec["occ_label_sample"] is None:
+                ol = r.get("occ_label_sample")
+                if isinstance(ol, str) and ol:
+                    rec["occ_label_sample"] = ol
 
     if len(buckets) > MAX_OUT_ROWS:
         raise RuntimeError(f"bom_flat: too many output groups ({len(buckets)} > {MAX_OUT_ROWS})")
@@ -333,24 +398,31 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
         if b["example_names"]:
             example_name = sorted([x for x in b["example_names"] if x])[0]
 
-        # Optional where_used summary from rep
-        where_used = p.get("where_used")
-        where_used_out: Optional[List[Dict[str, Any]]] = None
-        if isinstance(where_used, list) and where_used:
-            where_used_out = []
-            for wu in where_used[:MAX_WHERE_USED_PER_ROW]:
-                if isinstance(wu, dict):
-                    where_used_out.append(
-                        {
-                            "def_name": wu.get("def_name"),
-                            "from_parent_def_name": wu.get("from_parent_def_name"),
-                            "from_parent_def_sig": wu.get("from_parent_def_sig"),
-                            "occ_label_sample": wu.get("occ_label_sample"),
-                        }
-                    )
+        # where_used list built from BOM aggregation (not from parts_index)
+        wu_rows: Optional[List[Dict[str, Any]]] = None
+        wu_map = where_used_qty.get(gk)
+        if isinstance(wu_map, dict) and wu_map:
+            wu_rows = []
+            for (_psig, _pname), rec in sorted(wu_map.items(), key=lambda kv: (kv[0][1] or "", kv[0][0] or "")):
+                wu_rows.append(
+                    {
+                        "from_parent_def_name": rec.get("from_parent_def_name"),
+                        "from_parent_def_sig": rec.get("from_parent_def_sig"),
+                        "qty_in_parent": int(rec.get("qty_in_parent") or 0),
+                        "occ_label_sample": rec.get("occ_label_sample"),
+                    }
+                )
+            if len(wu_rows) > MAX_WHERE_USED_PER_ROW:
+                wu_rows = wu_rows[:MAX_WHERE_USED_PER_ROW]
+                wu_trunc = True
+            else:
+                wu_trunc = False
+        else:
+            wu_trunc = False
 
         row: Dict[str, Any] = {
             "common_part_id": gk,
+            "part_number": _stable_part_number(gk),
             "qty": int(b["qty"]),
             "category": cat,
             "category_source": src,
@@ -369,13 +441,35 @@ def _build_bom_flat(bom: Dict[str, Any], parts_index: Dict[str, Any], categories
             row["member_sig_keys"] = member_sigs_sorted[:MAX_MEMBER_SIGS_PER_ROW]
             row["member_sig_keys_truncated"] = True
 
-        if where_used_out is not None:
-            row["where_used"] = where_used_out
-            row["where_used_truncated"] = (len(where_used) > MAX_WHERE_USED_PER_ROW)
+        if wu_rows is not None:
+            row["where_used"] = wu_rows
+            row["where_used_truncated"] = bool(wu_trunc)
 
         out_rows.append(row)
 
-    out_rows.sort(key=lambda r: (str(r.get("category") or ""), str(r.get("common_part_id") or ""), str(r.get("representative_sig_key") or "")))
+    # 1) Sort by stable keys (no part_number yet)
+    out_rows.sort(
+        key=lambda r: (
+            str(r.get("category") or ""),
+            str(r.get("common_part_id") or ""),
+            str(r.get("representative_sig_key") or ""),
+        )
+    )
+
+    # 2) Assign deterministic, human-readable part numbers (per category sequence)
+    counters: Dict[str, int] = {}
+    for r in out_rows:
+        cat = str(r.get("category") or "unknown")
+        counters[cat] = counters.get(cat, 0) + 1
+        r["part_number"] = _fmt_part_no(PARTNO_PREFIX, cat, counters[cat])
+
+    # 3) Optional: keep output ordered by part_number for readability
+    out_rows.sort(
+        key=lambda r: (
+            str(r.get("category") or ""),
+            str(r.get("part_number") or ""),
+        )
+    )
 
     return {
         "schema": SCHEMA_OUT,

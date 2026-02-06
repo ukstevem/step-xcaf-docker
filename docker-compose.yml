@@ -87,7 +87,7 @@ services:
     environment:
       PYTHONPATH: /repo
     entrypoint: []
-    command: ["python", "/repo/step3_1_worker.py"]
+    command: ["python", "/repo/step3_1_daemon.py"]
     depends_on:
       - step2_worker
 
@@ -103,7 +103,7 @@ services:
     environment:
       PYTHONPATH: /repo
     entrypoint: []
-    command: ["python", "/repo/categoriser_worker.py"]
+    command: ["python", "/repo/step3_2_daemon.py"]
     depends_on:
       - step3_1_worker
 

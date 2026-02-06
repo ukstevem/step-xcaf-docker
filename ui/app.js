@@ -293,6 +293,34 @@ function renderPreflight(preflight, orientation) {
   if (preflightInfoEl) preflightInfoEl.textContent = "";
 }
 
+function fmtWhereUsed(it) {
+  const wu = it?.where_used;
+  if (!Array.isArray(wu) || wu.length === 0) return "";
+
+  // deterministic: sort by parent name then sig
+  const rows = wu.slice().sort((a, b) => {
+    const an = String(a?.from_parent_def_name || "");
+    const bn = String(b?.from_parent_def_name || "");
+    if (an !== bn) return an.localeCompare(bn);
+    const as = String(a?.from_parent_def_sig || "");
+    const bs = String(b?.from_parent_def_sig || "");
+    return as.localeCompare(bs);
+  });
+
+  const parts = rows.map(r => {
+    const name = String(r?.from_parent_def_name || r?.from_parent_def_sig || "").trim();
+    const q = Number(r?.qty_in_parent);
+    if (!name) return "";
+    if (Number.isFinite(q)) return `${name}×${q}`;
+    return name;
+  }).filter(Boolean);
+
+  let s = parts.join("; ");
+  if (it?.where_used_truncated) s += " (truncated)";
+  return s;
+}
+
+
 // ------------------------------
 // API calls
 // ------------------------------
@@ -1021,12 +1049,12 @@ function renderBomFlatUI() {
   if (!treeEl) return;
   treeEl.innerHTML = "";
 
-  const items = Array.isArray(bomData?.items) ? bomData.items : [];
+  const items = Array.isArray(bomFlatData?.items) ? bomFlatData.items : [];
 
   // filter
   const q = String(document.getElementById("bomSearch")?.value || "").trim().toLowerCase();
   const filtered = q
-    ? items.filter((it) => String(it.example_def_name || it.common_part_id || "").toLowerCase().includes(q))
+    ? items.filter((it) => String(it.part_number || it.common_part_id || "").toLowerCase().includes(q))
     : items;
 
   const table = document.createElement("table");
@@ -1039,7 +1067,7 @@ function renderBomFlatUI() {
       <th class="cell-right">Qty</th>
       <th>Category</th>
       <th class="cell-mono">BBox (mm)</th>
-      <th class="cell-mono">Group</th>
+      <th class="cell-mono">Where Used</th>
       <th class="cell-right">Members</th>
       <th class="cell-link">STL</th>
       <th class="cell-link">DWG</th>
@@ -1057,7 +1085,7 @@ function renderBomFlatUI() {
     const tr = document.createElement("tr");
 
     const tdPart = document.createElement("td");
-    tdPart.textContent = String(it.example_def_name || "—");
+    tdPart.textContent = String(it.part_number || "—");
 
     const tdQty = document.createElement("td");
     tdQty.className = "cell-right";
@@ -1071,9 +1099,45 @@ function renderBomFlatUI() {
     tdBbox.className = "cell-mono";
     tdBbox.textContent = fmtBboxSorted(it);
 
-    const tdGroup = document.createElement("td");
-    tdGroup.className = "cell-mono cell-muted";
-    tdGroup.textContent = String(it.common_part_id || "");
+    // ---- Where Used (multi-line) ----
+    const tdWhere = document.createElement("td");
+    tdWhere.className = "cell-muted where-used";
+
+    const wu = Array.isArray(it?.where_used) ? it.where_used : [];
+    if (wu.length > 0) {
+      const rows = wu.slice().sort((a, b) => {
+        const an = String(a?.from_parent_def_name || "");
+        const bn = String(b?.from_parent_def_name || "");
+        if (an !== bn) return an.localeCompare(bn);
+        const as = String(a?.from_parent_def_sig || "");
+        const bs = String(b?.from_parent_def_sig || "");
+        return as.localeCompare(bs);
+      });
+
+      for (const r of rows) {
+        const name = String(r?.from_parent_def_name || r?.from_parent_def_sig || "").trim();
+        const qIn = Number(r?.qty_in_parent);
+        if (!name) continue;
+
+        const line = document.createElement("div");
+        line.className = "wu-line";
+        line.textContent = Number.isFinite(qIn) ? `${name} × ${qIn}` : name;
+        tdWhere.appendChild(line);
+      }
+
+      if (it?.where_used_truncated) {
+        const note = document.createElement("div");
+        note.className = "wu-note";
+        note.textContent = "(truncated)";
+        tdWhere.appendChild(note);
+      }
+    } else {
+      tdWhere.textContent = "";
+    }
+
+    // tooltip: single line summary
+    tdWhere.title = fmtWhereUsed(it);
+    // -------------------------------
 
     const tdMembers = document.createElement("td");
     tdMembers.className = "cell-right cell-muted";
@@ -1087,11 +1151,12 @@ function renderBomFlatUI() {
     const drl = firstNonEmpty(it, ["drilling_url", "drill_url", "drilling_path", "drill_path", "html_url"]);
     const png = firstNonEmpty(it, ["png_url", "thumb_url", "thumbnail_url", "png_path", "thumb_path"]);
 
+    // IMPORTANT: append in the SAME order as <thead>
     tr.appendChild(tdPart);
     tr.appendChild(tdQty);
     tr.appendChild(tdCat);
     tr.appendChild(tdBbox);
-    tr.appendChild(tdGroup);
+    tr.appendChild(tdWhere);
     tr.appendChild(tdMembers);
 
     tr.appendChild(makeLinkCell("STL", stl, "Open representative STL"));
@@ -1141,6 +1206,7 @@ function renderBomFlatUI() {
 }
 
 
+
 async function tryLoadBom(runId) {
   stopBomPolling();
 
@@ -1164,6 +1230,31 @@ async function tryLoadBom(runId) {
   setStatus("Waiting for BOM…");
   bomPollTimer = setInterval(attempt, 1500);
 }
+
+async function tryLoadBomFlat(runId) {
+  stopBomPolling();
+
+  const attempt = async () => {
+    try {
+      const b = await fetchBomFlat(runId);
+      if (Array.isArray(b?.items)) {
+        bomFlatData = b;
+        renderBomFlatUI();
+        setStatus("Purchasing BOM loaded.");
+        stopBomPolling();
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+
+  const ok = await attempt();
+  if (ok) return;
+
+  setStatus("Waiting for Purchasing BOM…");
+  bomPollTimer = setInterval(attempt, 1500);
+}
+
 
 // ------------------------------
 // wiring + boot

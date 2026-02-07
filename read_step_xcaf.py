@@ -703,6 +703,8 @@ def build_xcaf_instances_json(
             "occ_id": occ_id,
             "parent_def": parent_def_id,
             "parent_occ": parent_occ,
+            "parent_occ_id": parent_occ,
+            "parent": parent_occ,
             "ref_def": ref_def_id,
             "name": occ_name,
             "depth": int(depth),
@@ -930,6 +932,15 @@ def build_xcaf_instances_json(
     children_by_parent_occ_out = {k: children_by_parent_occ[k] for k in sorted(children_by_parent_occ.keys())}
     occs_by_ref_def_out = {k: occs_by_ref_def[k] for k in sorted(occs_by_ref_def.keys())}
 
+    # ---- roots (occ_ids) for downstream tree builders / UI drilldown ----
+    roots_occ_ids: List[str] = []
+    lst = children_by_parent_occ.get(root_def_id)
+    if isinstance(lst, list):
+        roots_occ_ids = list(lst)
+
+    roots_occ_ids.sort()
+
+
     out = {
         "meta": {
             "step_filename": step_path_p.name,
@@ -955,6 +966,7 @@ def build_xcaf_instances_json(
             },
         },
         "root_def": root_def_id,
+        "roots": roots_occ_ids,
         "definitions": definitions_out,
         "occurrences": occurrences_out,
         "indexes": {

@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Body
-from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone
 
@@ -44,8 +44,10 @@ STATUS_REL = os.environ.get("STATUS_REL", "status.json")
 XCAF_INSTANCES_REL = os.environ.get("XCAF_INSTANCES_REL", "xcaf_instances.json")
 OCC_TREE_REL = os.environ.get("OCC_TREE_REL", "occ_tree.json")
 ANALYSIS_PACK_REL = os.environ.get("ANALYSIS_PACK_REL", "analysis_pack.json")
+ROOT_DEFS_REL = os.environ.get("ROOT_DEFS_REL", "root_defs.json")
 
 BOM_FLAT_REL = os.environ.get("BOM_FLAT_REL", "bom_flat.json")
+ROOT_REVIEW_REL = os.environ.get("ROOT_REVIEW_REL", "root_review.json")
 
 app = FastAPI(title="STEP UI Starter (Step 1)")
 
@@ -69,6 +71,32 @@ def sw():
 
 def _now_utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _utc_iso_z() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_root_review(run_dir: Path) -> Dict[str, Any]:
+    p = run_dir / ROOT_REVIEW_REL
+    if not p.is_file():
+        return {"schema": "root_review.v1", "run_id": run_dir.name, "items": {}}
+    obj = _load_json_obj(p)
+    if not isinstance(obj, dict):
+        return {"schema": "root_review.v1", "run_id": run_dir.name, "items": {}}
+    items = obj.get("items")
+    if not isinstance(items, dict):
+        obj["items"] = {}
+    if not isinstance(obj.get("schema"), str):
+        obj["schema"] = "root_review.v1"
+    if not isinstance(obj.get("run_id"), str):
+        obj["run_id"] = run_dir.name
+    return obj
+
+
+def _write_root_review(run_dir: Path, obj: Dict[str, Any]) -> None:
+    p = run_dir / ROOT_REVIEW_REL
+    _write_json(p, obj)
 
 
 def _safe_run_id() -> str:
@@ -192,6 +220,67 @@ def _json_fileresponse(p: Path) -> FileResponse:
         media_type="application/json",
         headers={"Cache-Control": "no-store"},
     )
+
+def _ensure_root_defs(run_dir: Path) -> Path:
+    """
+    Ensure root_defs.json exists.
+    Builds it from occ_tree.json by grouping top-level roots by ref_def_id.
+    """
+    out_path = run_dir / ROOT_DEFS_REL
+    if out_path.is_file():
+        return out_path
+
+    tree_path = run_dir / OCC_TREE_REL
+    if not tree_path.is_file():
+        raise HTTPException(status_code=404, detail=f"{OCC_TREE_REL} not found")
+
+    d = _load_json_obj(tree_path)
+    roots = d.get("roots") or []
+    nodes = d.get("nodes") or {}
+    if not isinstance(roots, list) or not isinstance(nodes, dict):
+        raise HTTPException(status_code=500, detail="occ_tree.json invalid schema")
+
+    by_def: Dict[str, Dict[str, Any]] = {}
+    order: list[str] = []
+
+    for occ_id in roots:
+        if not isinstance(occ_id, str):
+            continue
+        n = nodes.get(occ_id) or {}
+        if not isinstance(n, dict):
+            n = {}
+
+        ref = n.get("ref_def_id")
+        if not isinstance(ref, str) or not ref.strip():
+            ref = "__NO_REF_DEF__"
+
+        if ref not in by_def:
+            name = (n.get("display_name") or n.get("name") or "")
+            if not isinstance(name, str):
+                name = ""
+            kids = n.get("children") or []
+            if not isinstance(kids, list):
+                kids = []
+
+            by_def[ref] = {
+                "root_ref_def_id": ref,
+                "name": name.strip(),
+                "root_occ_qty": 0,
+                "rep_root_occ_id": occ_id,
+                "child_count": int(len(kids)),
+                "sample_root_occ_ids": [],
+            }
+            order.append(ref)
+
+        rec = by_def[ref]
+        rec["root_occ_qty"] = int(rec.get("root_occ_qty") or 0) + 1
+        s = rec.get("sample_root_occ_ids")
+        if isinstance(s, list) and len(s) < 3:
+            s.append(occ_id)
+
+    obj = {"run_id": run_dir.name, "count": len(order), "items": [by_def[k] for k in order]}
+    _write_json(out_path, obj)
+    return out_path
 
 
 # ----------------------------
@@ -1214,3 +1303,48 @@ def get_bom_flat(run_id: str):
         raise HTTPException(status_code=404, detail=f"{rel} not found")
 
     return FileResponse(p, media_type="application/json")
+
+@app.get("/api/root_defs/{run_id}")
+def get_root_defs(run_id: str):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+    p = _ensure_root_defs(run_dir)
+    return _json_fileresponse(p)
+
+
+@app.get("/api/root_review/{run_id}")
+def get_root_review(run_id: str):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+    obj = _load_root_review(run_dir)
+    return JSONResponse(obj, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/root_review/{run_id}")
+def post_root_review(run_id: str, payload: Dict[str, Any]):
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    ref = payload.get("root_ref_def_id")
+    reviewed = payload.get("reviewed")
+
+    if not isinstance(ref, str) or not ref.strip():
+        raise HTTPException(status_code=400, detail="root_ref_def_id required")
+    if not isinstance(reviewed, bool):
+        raise HTTPException(status_code=400, detail="reviewed must be boolean")
+
+    obj = _load_root_review(run_dir)
+    items = obj.get("items")
+    if not isinstance(items, dict):
+        items = {}
+        obj["items"] = items
+
+    items[ref] = {
+        "reviewed": reviewed,
+        "updated_utc": _utc_iso_z(),
+    }
+    _write_root_review(run_dir, obj)
+    return JSONResponse(obj, headers={"Cache-Control": "no-store"})

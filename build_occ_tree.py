@@ -412,7 +412,7 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
                     parent_map[kid] = oid
     else:
         for oid, rec in occs.items():
-            parent = _pick_first(rec.get("parent_occ_id"), rec.get("parent"))
+            parent = _pick_first(rec.get("parent_occ_id"), rec.get("parent_occ"), rec.get("parent"))
             if parent and parent in occs:
                 parent_map[oid] = parent
                 children_map[parent].append(oid)
@@ -423,10 +423,12 @@ def build_occ_tree(run_id: str, runs_root: Path) -> Dict[str, Any]:
     if isinstance(roots_raw, list):
         for r in roots_raw:
             rid = _safe_str(r).strip()
-            if rid and rid in occs:
+            if rid and rid in occs and parent_map.get(rid) is None:
                 roots.append(rid)
+
     if not roots:
         roots = [oid for oid, p in parent_map.items() if not p]
+
 
     # Build node records
     nodes: Dict[str, Dict[str, Any]] = {}

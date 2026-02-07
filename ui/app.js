@@ -1,7 +1,7 @@
 // ui/app.js (full replacement) — clean, deterministic, no injected DOM
-// Requires index.html to contain ids: treeSection, treeTitle, treeHint, viewAssembly, viewBom, tree, viewer, nodeMeta
+// Requires index.html to contain ids: treeSection, treeTitle, treeHint, viewAssembly, viewBom, viewDash, dash, tree, viewer, nodeMeta
 // Uses API endpoints in ui_server.py: /api/create_run, /api/preview/{run}, /api/state/{run}, /api/progress/{run},
-// /api/orientation/{run}, /api/tree_grouped/{run}, /api/bom/{run}, /api/explode_plan/{run}
+// /api/orientation/{run}, /api/tree/{run}, /api/bom/{run}, /api/bom_flat/{run}, /api/explode_plan/{run}, /api/root_defs/{run}
 
 const statusEl = document.getElementById("status");
 const warningEl = document.getElementById("warning");
@@ -19,12 +19,13 @@ const treeTitleEl = document.getElementById("treeTitle");
 const treeHintEl = document.getElementById("treeHint");
 const viewAssemblyBtn = document.getElementById("viewAssembly");
 const viewBomBtn = document.getElementById("viewBom");
+const viewDashBtn = document.getElementById("viewDash");
 const treeEl = document.getElementById("tree");
+const dashEl = document.getElementById("dash");
 const viewerEl = document.getElementById("viewer");
 const nodeMetaEl = document.getElementById("nodeMeta");
 const btnBomViewer = document.getElementById("btnBomViewer");
 const btnBomPurchasing = document.getElementById("btnBomPurchasing");
-
 
 // 6-face images (required in index.html)
 const imgTop = document.getElementById("pv_top");
@@ -46,6 +47,7 @@ const btnRight = document.getElementById("btnRight");
 const rotSel = document.getElementById("rotSel");
 const btnApplyOrient = document.getElementById("applyOrient");
 
+const DASH_MAJOR_MIN_CHILDREN = 50;
 const FACE_KEYS = ["top", "bottom", "front", "back", "left", "right"];
 
 const faceImg = {
@@ -65,12 +67,18 @@ let currentOrientation = { plan_source: "top", rotation_deg: 0 };
 let progressES = null;
 let statePollTimer = null;
 
-let currentView = "bom"; // "assembly" | "bom" | "bom_flat"
+let currentView = "dashboard"; // "dashboard" | "assembly" | "bom" | "bom_flat"
 let treeData = null;
 let bomData = null;
 let treePollTimer = null;
 let bomPollTimer = null;
 let bomFlatData = null;
+
+let rootDefsData = null;
+let activeAssemblyRootOccId = null; // when set, assembly view shows only this subtree
+
+let rootReviewData = { schema: "root_review.v1", run_id: null, items: {} };
+let dashHideReviewed = true;
 
 // explode plan (server-backed)
 let explodePlan = { schema: "explode_plan.v1", run_id: null, items: {} };
@@ -116,9 +124,10 @@ function makeLinkCell(label, url, title) {
     a.href = "#";
   } else {
     // Most of our URLs are run-relative. If it’s already absolute, keep it.
-    const abs = url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")
-      ? url
-      : resolveRunUrl(currentRunId, url);
+    const abs =
+      url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")
+        ? url
+        : resolveRunUrl(currentRunId, url);
 
     if (!abs) {
       a.classList.add("missing");
@@ -143,7 +152,9 @@ function fmtBbox(it) {
     null;
 
   if (!sz) return "";
-  const x = Number(sz[0]), y = Number(sz[1]), z = Number(sz[2]);
+  const x = Number(sz[0]),
+    y = Number(sz[1]),
+    z = Number(sz[2]);
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return "";
   return `${x.toFixed(1)}×${y.toFixed(1)}×${z.toFixed(1)}`;
 }
@@ -307,19 +318,319 @@ function fmtWhereUsed(it) {
     return as.localeCompare(bs);
   });
 
-  const parts = rows.map(r => {
-    const name = String(r?.from_parent_def_name || r?.from_parent_def_sig || "").trim();
-    const q = Number(r?.qty_in_parent);
-    if (!name) return "";
-    if (Number.isFinite(q)) return `${name}×${q}`;
-    return name;
-  }).filter(Boolean);
+  const parts = rows
+    .map((r) => {
+      const name = String(r?.from_parent_def_name || r?.from_parent_def_sig || "").trim();
+      const q = Number(r?.qty_in_parent);
+      if (!name) return "";
+      if (Number.isFinite(q)) return `${name}×${q}`;
+      return name;
+    })
+    .filter(Boolean);
 
   let s = parts.join("; ");
   if (it?.where_used_truncated) s += " (truncated)";
   return s;
 }
 
+// ------------------------------
+// Dashboard (Root Definitions) renderer
+// ------------------------------
+
+async function fetchRootReview(runId) {
+  const res = await fetch(`/api/root_review/${encodeURIComponent(runId)}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+async function postRootReview(runId, rootRefDefId, reviewed) {
+  const res = await fetch(`/api/root_review/${encodeURIComponent(runId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root_ref_def_id: rootRefDefId, reviewed: Boolean(reviewed) }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+function isReviewed(rootRefDefId) {
+  const items = rootReviewData?.items;
+  if (!rootRefDefId || typeof rootRefDefId !== "string") return false;
+  return Boolean(items && typeof items === "object" && items[rootRefDefId]?.reviewed);
+}
+
+async function tryLoadDashboard(runId) {
+  const attempt = async () => {
+    try {
+      const d = await fetchRootDefs(runId);
+      if (Array.isArray(d?.items)) {
+        rootDefsData = d;
+        try {
+          rootReviewData = await fetchRootReview(runId);
+        } catch (_) {
+          rootReviewData = { schema: "root_review.v1", run_id: runId, items: {} };
+        }
+        renderDashboardUI();
+        setStatus("Dashboard loaded.");
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+
+  const ok = await attempt();
+  if (ok) return;
+
+  setStatus("Waiting for dashboard…");
+  // Reuse treePollTimer slot to avoid adding more timers
+  stopTreePolling();
+  treePollTimer = setInterval(attempt, 1500);
+}
+
+function renderDashboardUI() {
+  if (!dashEl) return;
+  dashEl.innerHTML = "";
+
+  const itemsRaw = Array.isArray(rootDefsData?.items) ? rootDefsData.items.slice() : [];
+
+  // deterministic sort helper
+  const sortItems = (arr) =>
+    arr.sort((a, b) => {
+      const ac = Number(a?.child_count || 0),
+        bc = Number(b?.child_count || 0);
+      if (bc !== ac) return bc - ac;
+      const aq = Number(a?.root_occ_qty || 0),
+        bq = Number(b?.root_occ_qty || 0);
+      if (bq !== aq) return bq - aq;
+      const an = String(a?.name || ""),
+        bn = String(b?.name || "");
+      return an.localeCompare(bn);
+    });
+
+  const major = [];
+  const minor = [];
+  const loose = [];
+
+  for (const it of itemsRaw) {
+    const cc = Number(it?.child_count || 0);
+    if (cc >= DASH_MAJOR_MIN_CHILDREN) major.push(it);
+    else if (cc > 0) minor.push(it);
+    else loose.push(it);
+  }
+
+  const filt = (arr) => {
+    if (!dashHideReviewed) return arr;
+    return arr.filter((it) => !isReviewed(String(it?.root_ref_def_id || "")));
+  };
+
+  // NOTE: we keep sections counts based on total, but render filtered lists
+  const majorF = filt(major);
+  const minorF = filt(minor);
+  const looseF = filt(loose);
+
+  sortItems(major);
+  sortItems(minor);
+
+  // Loose parts: sort by qty then name
+  loose.sort((a, b) => {
+    const aq = Number(a?.root_occ_qty || 0),
+      bq = Number(b?.root_occ_qty || 0);
+    if (bq !== aq) return bq - aq;
+    const an = String(a?.name || ""),
+      bn = String(b?.name || "");
+    return an.localeCompare(bn);
+  });
+
+  const makeSection = (titleText, subtitleText) => {
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "14px";
+
+    const hdr = document.createElement("div");
+    hdr.style.display = "flex";
+    hdr.style.justifyContent = "space-between";
+    hdr.style.alignItems = "baseline";
+    hdr.style.gap = "10px";
+    hdr.style.padding = "10px 10px 6px 10px";
+
+    const h = document.createElement("div");
+    h.style.fontWeight = "700";
+    h.textContent = titleText;
+
+    const s = document.createElement("div");
+    s.style.fontSize = "12px";
+    s.style.color = "#666";
+    s.textContent = subtitleText || "";
+
+    hdr.appendChild(h);
+    hdr.appendChild(s);
+
+    wrap.appendChild(hdr);
+    return wrap;
+  };
+
+  const makeCard = (it) => {
+    const card = document.createElement("div");
+    card.style.border = "1px solid #ddd";
+    card.style.borderRadius = "12px";
+    card.style.padding = "12px";
+    card.style.background = "#fff";
+    card.style.boxShadow = "0 1px 2px rgba(0,0,0,0.04)";
+
+    const title = document.createElement("div");
+    title.style.fontWeight = "600";
+    title.style.marginBottom = "8px";
+    title.textContent = String(it?.name || it?.root_ref_def_id || "—");
+
+    const meta = document.createElement("div");
+    meta.style.fontSize = "12px";
+    meta.style.color = "#555";
+    meta.style.display = "flex";
+    meta.style.gap = "10px";
+    meta.style.flexWrap = "wrap";
+    meta.innerHTML = `
+      <span><b>Qty</b>: ${Number(it?.root_occ_qty || 0)}</span>
+      <span><b>Children</b>: ${Number(it?.child_count || 0)}</span>
+    `;
+
+    const ref = document.createElement("div");
+    ref.style.marginTop = "6px";
+    ref.style.fontSize = "11px";
+    ref.style.color = "#777";
+    ref.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
+    ref.textContent = `ref_def_id: ${String(it?.root_ref_def_id || "")}`;
+
+    // Reviewed checkbox
+    const chkWrap = document.createElement("label");
+    chkWrap.style.display = "flex";
+    chkWrap.style.alignItems = "center";
+    chkWrap.style.gap = "8px";
+    chkWrap.style.marginTop = "10px";
+    chkWrap.style.fontSize = "12px";
+    chkWrap.style.color = "#444";
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = isReviewed(String(it?.root_ref_def_id || ""));
+    cb.onclick = (e) => e.stopPropagation();
+    cb.onchange = async () => {
+      try {
+        const rid = String(it?.root_ref_def_id || "");
+        rootReviewData = await postRootReview(currentRunId, rid, cb.checked);
+        renderDashboardUI();
+      } catch (e) {
+        cb.checked = !cb.checked;
+        setWarning(e?.message || String(e));
+      }
+    };
+
+    const cbTxt = document.createElement("span");
+    cbTxt.textContent = "Reviewed";
+
+    chkWrap.appendChild(cb);
+    chkWrap.appendChild(cbTxt);
+
+    const btn = document.createElement("button");
+    btn.textContent = "Open";
+    btn.style.marginTop = "10px";
+    btn.onclick = async () => {
+      activeAssemblyRootOccId = String(it?.rep_root_occ_id || "");
+      if (!activeAssemblyRootOccId) return;
+
+      if (treeTitleEl)
+        treeTitleEl.textContent = `Assembly: ${String(it?.name || it?.root_ref_def_id || "—")}`;
+      if (treeHintEl) treeHintEl.textContent = "Scoped view. Use Dashboard to pick another assembly.";
+
+      setViewUi("assembly");
+      await loadViewForRun(currentRunId, "assembly");
+    };
+
+    card.appendChild(title);
+    card.appendChild(meta);
+    card.appendChild(ref);
+    card.appendChild(chkWrap);
+    card.appendChild(btn);
+    return card;
+  };
+
+  const makeGrid = (arr) => {
+    const grid = document.createElement("div");
+    grid.style.display = "grid";
+    grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(280px, 1fr))";
+    grid.style.gap = "12px";
+    for (const it of arr) grid.appendChild(makeCard(it));
+    return grid;
+  };
+
+  // Major assemblies
+  const secMajor = makeSection(
+    "Major assemblies",
+    `child_count ≥ ${DASH_MAJOR_MIN_CHILDREN}  •  ${majorF.length}/${major.length} visible`
+  );
+  secMajor.appendChild(makeGrid(majorF));
+  dashEl.appendChild(secMajor);
+
+  // Minor assemblies
+  const secMinor = makeSection(
+    "Minor assemblies",
+    `child_count 1–${DASH_MAJOR_MIN_CHILDREN - 1}  •  ${minorF.length}/${minor.length} visible`
+  );
+  secMinor.appendChild(makeGrid(minorF));
+  dashEl.appendChild(secMinor);
+
+  // Loose parts as compact list (not cards)
+  const secLoose = makeSection(
+    "Loose top-level parts",
+    `child_count = 0  •  ${looseF.length}/${loose.length} visible`
+  );
+  const list = document.createElement("div");
+  list.style.padding = "0 10px 10px 10px";
+
+  const tbl = document.createElement("table");
+  tbl.className = "bom";
+  tbl.innerHTML = `
+    <thead>
+      <tr>
+        <th>Part</th>
+        <th class="cell-right">Qty</th>
+        <th class="cell-mono">ref_def_id</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  `;
+
+  const tb = tbl.querySelector("tbody");
+  for (const it of looseF) {
+    const tr = document.createElement("tr");
+    const name = String(it?.name || "—");
+    const qty = Number(it?.root_occ_qty || 0);
+    const rid = String(it?.root_ref_def_id || "");
+
+    tr.innerHTML = `
+      <td>${name}</td>
+      <td class="cell-right">${qty}</td>
+      <td class="cell-mono">${rid}</td>
+    `;
+
+    tr.style.cursor = "pointer";
+    tr.title = "Open (scoped)";
+    tr.onclick = async () => {
+      activeAssemblyRootOccId = String(it?.rep_root_occ_id || "");
+      if (!activeAssemblyRootOccId) return;
+
+      if (treeTitleEl) treeTitleEl.textContent = `Assembly: ${name}`;
+      if (treeHintEl) treeHintEl.textContent = "Scoped view. Use Dashboard to pick another assembly.";
+
+      setViewUi("assembly");
+      await loadViewForRun(currentRunId, "assembly");
+    };
+
+    tb.appendChild(tr);
+  }
+
+  list.appendChild(tbl);
+  secLoose.appendChild(list);
+  dashEl.appendChild(secLoose);
+}
 
 // ------------------------------
 // API calls
@@ -348,8 +659,9 @@ async function postOrientation(runId, plan_source, rotation_deg) {
   return await res.json();
 }
 
-async function fetchTreeGrouped(runId) {
-  const res = await fetch(`/api/tree_grouped/${encodeURIComponent(runId)}`, { cache: "no-store" });
+// ✅ Assembly drill-down must use the raw occurrence tree (occ_tree.json)
+async function fetchTreeOcc(runId) {
+  const res = await fetch(`/api/tree/${encodeURIComponent(runId)}`, { cache: "no-store" });
   if (!res.ok) throw new Error(await res.text());
   return await res.json();
 }
@@ -368,6 +680,13 @@ async function fetchBomFlat(runId) {
   }
   return await res.json();
 }
+
+async function fetchRootDefs(runId) {
+  const res = await fetch(`/api/root_defs/${encodeURIComponent(runId)}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
 async function fetchExplodePlan(runId) {
   const res = await fetch(`/api/explode_plan/${encodeURIComponent(runId)}`, { cache: "no-store" });
   if (!res.ok) throw new Error(await res.text());
@@ -400,11 +719,10 @@ async function refreshFromState(runId) {
       setStatus("Preview ready. Loading…");
       stopStatePolling();
 
-      // show tree/bom section
       if (treeSectionEl) treeSectionEl.style.display = "block";
 
-      // load current view
-      await loadViewForRun(currentRunId, currentView);
+      setViewUi("dashboard");
+      await loadViewForRun(currentRunId, "dashboard");
     }
     return true;
   }
@@ -483,40 +801,45 @@ function wireFaceClicks() {
 function setViewUi(view) {
   currentView = view;
 
-  const isBom = (view === "bom" || view === "bom_flat");
+  const isBom = view === "bom" || view === "bom_flat";
+  const isDash = view === "dashboard";
+
+  if (dashEl) dashEl.style.display = isDash ? "block" : "none";
+  if (treeEl) treeEl.style.display = isDash ? "none" : "block";
+  if (viewerEl) viewerEl.style.display = isDash ? "none" : "block";
 
   if (treeTitleEl) {
     treeTitleEl.textContent =
-      view === "bom_flat" ? "Purchasing BOM" :
-      view === "bom" ? "BOM (Global)" :
-      "Assembly (Grouped)";
+      isDash ? "Assemblies (Unique)" : view === "bom_flat" ? "Purchasing BOM" : view === "bom" ? "BOM (Global)" : "Assembly (Occurrence)";
   }
 
   if (treeHintEl) {
     treeHintEl.textContent =
-      view === "bom"
+      isDash
+        ? "Pick an assembly to drill down."
+        : view === "bom"
         ? "Tick Explode where needed. Click a row to load STL."
         : isBom
-          ? "Purchasing view. Click a row to load STL."
-          : "Click a row to load STL";
+        ? "Purchasing view. Click a row to load STL."
+        : "Click a row to load STL";
   }
 
   const bomSearch = document.getElementById("bomSearch");
   if (bomSearch) bomSearch.style.display = isBom ? "block" : "none";
 
   if (viewAssemblyBtn) viewAssemblyBtn.disabled = view === "assembly";
-  if (viewBomBtn) viewBomBtn.disabled = isBom; // disable BOM (Global) button if any BOM view is active
+  if (viewBomBtn) viewBomBtn.disabled = isBom;
+  if (viewDashBtn) viewDashBtn.disabled = isDash;
 
   if (btnBomViewer) btnBomViewer.disabled = view === "bom";
   if (btnBomPurchasing) btnBomPurchasing.disabled = view === "bom_flat";
 }
 
-
-
 function wireViewButtons() {
   if (viewAssemblyBtn) {
     viewAssemblyBtn.onclick = async () => {
       if (!currentRunId) return;
+      activeAssemblyRootOccId = null;
       setViewUi("assembly");
       await loadViewForRun(currentRunId, "assembly");
     };
@@ -524,8 +847,17 @@ function wireViewButtons() {
   if (viewBomBtn) {
     viewBomBtn.onclick = async () => {
       if (!currentRunId) return;
+      activeAssemblyRootOccId = null;
       setViewUi("bom");
       await loadViewForRun(currentRunId, "bom");
+    };
+  }
+  if (viewDashBtn) {
+    viewDashBtn.onclick = async () => {
+      if (!currentRunId) return;
+      activeAssemblyRootOccId = null;
+      setViewUi("dashboard");
+      await loadViewForRun(currentRunId, "dashboard");
     };
   }
 }
@@ -534,6 +866,7 @@ function wireBomModeButtons() {
   if (btnBomViewer) {
     btnBomViewer.onclick = async () => {
       if (!currentRunId) return;
+      activeAssemblyRootOccId = null;
       setViewUi("bom");
       await loadViewForRun(currentRunId, "bom");
     };
@@ -542,14 +875,23 @@ function wireBomModeButtons() {
   if (btnBomPurchasing) {
     btnBomPurchasing.onclick = async () => {
       if (!currentRunId) return;
+      activeAssemblyRootOccId = null;
       setViewUi("bom_flat");
       await loadViewForRun(currentRunId, "bom_flat");
     };
   }
 }
 
-
 async function loadViewForRun(runId, view) {
+  if (view === "dashboard") {
+    stopTreePolling();
+    stopBomPolling();
+    try {
+      await tryLoadDashboard(runId);
+    } catch (_) {}
+    return;
+  }
+
   // always refresh explode plan (cheap + keeps checkboxes accurate)
   try {
     explodePlan = await fetchExplodePlan(runId);
@@ -573,7 +915,6 @@ async function loadViewForRun(runId, view) {
   stopBomPolling();
   await tryLoadTree(runId);
 }
-
 
 // ------------------------------
 // explode plan helpers
@@ -640,19 +981,15 @@ function initViewerOnce() {
     _renderer.setSize(w, h, false);
   }
 
-  // Window resize still helps, but panel resize is the real fix
   window.addEventListener("resize", applySize);
 
-  // Observe viewer element size changes (flexbox, split panes, etc.)
   const ro = new ResizeObserver(() => {
     applySize();
-    // Optional: if something is loaded, refit after resize so it stays framed
-    if (_currentMesh) fitToObject(_currentMesh);                                  //remove if jittery
+    if (_currentMesh) fitToObject(_currentMesh);
   });
   ro.observe(viewerEl);
 
   applySize();
-
 
   (function animate() {
     requestAnimationFrame(animate);
@@ -666,8 +1003,12 @@ function initViewerOnce() {
 function clearMesh() {
   if (!_currentMesh || !_scene) return;
   _scene.remove(_currentMesh);
-  try { _currentMesh.geometry.dispose(); } catch (_) {}
-  try { _currentMesh.material.dispose(); } catch (_) {}
+  try {
+    _currentMesh.geometry.dispose();
+  } catch (_) {}
+  try {
+    _currentMesh.material.dispose();
+  } catch (_) {}
   _currentMesh = null;
 }
 
@@ -683,12 +1024,8 @@ function fitToObject(obj, offset = 1.25) {
 
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
 
-  // Keep current view direction
-  const viewDir = new THREE.Vector3()
-    .subVectors(_camera.position, _controls.target)
-    .normalize();
+  const viewDir = new THREE.Vector3().subVectors(_camera.position, _controls.target).normalize();
 
-  // Fit using FOV
   const fov = (_camera.fov * Math.PI) / 180.0;
   let distance = (maxDim * 0.5) / Math.tan(fov * 0.5);
   distance *= offset;
@@ -704,7 +1041,6 @@ function fitToObject(obj, offset = 1.25) {
   _controls.minDistance = distance / 20.0;
   _controls.update();
 }
-
 
 async function loadSTL(url) {
   await loadViewerModules();
@@ -727,7 +1063,6 @@ async function loadSTL(url) {
         const mat = new THREE.MeshStandardMaterial();
         const mesh = new THREE.Mesh(geom, mat);
 
-        // If your STL is already in the right orientation, remove this line.
         mesh.rotation.set(-Math.PI / 2, 0, 0);
 
         _scene.add(mesh);
@@ -741,9 +1076,8 @@ async function loadSTL(url) {
   });
 }
 
-
 // ------------------------------
-// Assembly (Grouped) renderer
+// Assembly (Occurrence) renderer
 // ------------------------------
 function nodeRecord(occId) {
   return treeData?.nodes?.[occId] || null;
@@ -831,8 +1165,6 @@ function makeNodeRow(occId) {
   return li;
 }
 
-
-
 function renderTreeUI() {
   if (!treeEl) return;
   treeEl.innerHTML = "";
@@ -843,7 +1175,9 @@ function renderTreeUI() {
   ul.style.paddingLeft = "0";
 
   const roots = Array.isArray(treeData?.roots) ? treeData.roots : [];
-  for (const r of roots) ul.appendChild(makeNodeRow(r));
+  const showRoots = activeAssemblyRootOccId ? [activeAssemblyRootOccId] : roots;
+
+  for (const r of showRoots) ul.appendChild(makeNodeRow(r));
 
   treeEl.appendChild(ul);
   renderNodeMeta({});
@@ -855,7 +1189,7 @@ async function tryLoadTree(runId) {
 
   const attempt = async () => {
     try {
-      const t = await fetchTreeGrouped(runId);
+      const t = await fetchTreeOcc(runId);
       if (t?.nodes && Object.keys(t.nodes).length > 0) {
         treeData = t;
         renderTreeUI();
@@ -883,7 +1217,6 @@ function renderBomUI() {
 
   const items = Array.isArray(bomData?.items) ? bomData.items : [];
 
-  // filter
   const q = String(document.getElementById("bomSearch")?.value || "").trim().toLowerCase();
   const filtered = q
     ? items.filter((it) => String(it.part_number || it.def_name || "").toLowerCase().includes(q))
@@ -929,7 +1262,6 @@ function renderBomUI() {
 
     const tr = document.createElement("tr");
 
-    // explode checkbox
     const tdExplode = document.createElement("td");
     const cb = document.createElement("input");
     cb.type = "checkbox";
@@ -937,13 +1269,11 @@ function renderBomUI() {
     cb.disabled = !(solidCount != null && solidCount > 1) || !defSig;
     cb.checked = defSig ? isMarked(defSig) : false;
 
-    // don't trigger row click when toggling checkbox
     cb.addEventListener("click", (e) => e.stopPropagation());
     cb.onchange = async () => {
       try {
         await toggleMark(currentRunId, defSig, partNo, solidCount, cb.checked);
         setStatus(cb.checked ? "Marked for explosion." : "Unmarked.");
-        // keep node meta accurate if selected
         renderNodeMeta({ ...it, explode_marked: defSig ? isMarked(defSig) : false });
       } catch (e) {
         cb.checked = !cb.checked;
@@ -978,10 +1308,9 @@ function renderBomUI() {
     const stl = firstNonEmpty(it, ["stl_url", "stl_path", "stl"]);
     const dwg = firstNonEmpty(it, ["dwg_url", "dwg_path", "dwg"]);
     const dxf = firstNonEmpty(it, ["dxf_url", "dxf_path", "dxf"]);
-    const nc  = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
+    const nc = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
     const drl = firstNonEmpty(it, ["drilling_url", "drill_url", "drilling_path", "drill_path", "html_url"]);
     const png = firstNonEmpty(it, ["png_url", "thumb_url", "thumbnail_url", "png_path", "thumb_path"]);
-
 
     tr.appendChild(tdExplode);
     tr.appendChild(tdPart);
@@ -993,12 +1322,11 @@ function renderBomUI() {
     tr.appendChild(makeLinkCell("STL", stl, "Open STL"));
     tr.appendChild(makeLinkCell("DWG", dwg, "Open DWG"));
     tr.appendChild(makeLinkCell("DXF", dxf, "Open DXF"));
-    tr.appendChild(makeLinkCell("NC",  nc,  "Open NC1"));
+    tr.appendChild(makeLinkCell("NC", nc, "Open NC1"));
     tr.appendChild(makeLinkCell("DRILL", drl, "Open drilling drawing"));
     tr.appendChild(makeLinkCell("PNG", png, "Open thumbnail image"));
 
     tr.onclick = async () => {
-      // selection highlight
       treeEl.querySelectorAll("tr.selected").forEach((x) => x.classList.remove("selected"));
       tr.classList.add("selected");
 
@@ -1040,7 +1368,9 @@ function renderBomUI() {
 function fmtBboxSorted(it) {
   const s = it?.bbox_sorted_mm;
   if (!Array.isArray(s) || s.length < 3) return "";
-  const a = Number(s[0]), b = Number(s[1]), c = Number(s[2]);
+  const a = Number(s[0]),
+    b = Number(s[1]),
+    c = Number(s[2]);
   if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return "";
   return `${a.toFixed(1)}×${b.toFixed(1)}×${c.toFixed(1)}`;
 }
@@ -1051,7 +1381,6 @@ function renderBomFlatUI() {
 
   const items = Array.isArray(bomFlatData?.items) ? bomFlatData.items : [];
 
-  // filter
   const q = String(document.getElementById("bomSearch")?.value || "").trim().toLowerCase();
   const filtered = q
     ? items.filter((it) => String(it.part_number || it.common_part_id || "").toLowerCase().includes(q))
@@ -1089,7 +1418,7 @@ function renderBomFlatUI() {
 
     const tdQty = document.createElement("td");
     tdQty.className = "cell-right";
-    tdQty.textContent = (typeof it.qty === "number") ? String(it.qty) : "";
+    tdQty.textContent = typeof it.qty === "number" ? String(it.qty) : "";
 
     const tdCat = document.createElement("td");
     tdCat.className = "cell-muted";
@@ -1099,7 +1428,6 @@ function renderBomFlatUI() {
     tdBbox.className = "cell-mono";
     tdBbox.textContent = fmtBboxSorted(it);
 
-    // ---- Where Used (multi-line) ----
     const tdWhere = document.createElement("td");
     tdWhere.className = "cell-muted where-used";
 
@@ -1135,23 +1463,19 @@ function renderBomFlatUI() {
       tdWhere.textContent = "";
     }
 
-    // tooltip: single line summary
     tdWhere.title = fmtWhereUsed(it);
-    // -------------------------------
 
     const tdMembers = document.createElement("td");
     tdMembers.className = "cell-right cell-muted";
-    tdMembers.textContent = (typeof it.members_count === "number") ? String(it.members_count) : "";
+    tdMembers.textContent = typeof it.members_count === "number" ? String(it.members_count) : "";
 
-    // representative STL + future link columns (same pattern as global BOM)
     const stl = firstNonEmpty(it, ["representative_stl_url", "stl_url", "stl_path", "stl"]);
     const dwg = firstNonEmpty(it, ["dwg_url", "dwg_path", "dwg"]);
     const dxf = firstNonEmpty(it, ["dxf_url", "dxf_path", "dxf"]);
-    const nc  = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
+    const nc = firstNonEmpty(it, ["nc_url", "nc1_url", "nc1_path", "nc_path", "nc"]);
     const drl = firstNonEmpty(it, ["drilling_url", "drill_url", "drilling_path", "drill_path", "html_url"]);
     const png = firstNonEmpty(it, ["png_url", "thumb_url", "thumbnail_url", "png_path", "thumb_path"]);
 
-    // IMPORTANT: append in the SAME order as <thead>
     tr.appendChild(tdPart);
     tr.appendChild(tdQty);
     tr.appendChild(tdCat);
@@ -1162,7 +1486,7 @@ function renderBomFlatUI() {
     tr.appendChild(makeLinkCell("STL", stl, "Open representative STL"));
     tr.appendChild(makeLinkCell("DWG", dwg, "Open DWG"));
     tr.appendChild(makeLinkCell("DXF", dxf, "Open DXF"));
-    tr.appendChild(makeLinkCell("NC",  nc,  "Open NC1"));
+    tr.appendChild(makeLinkCell("NC", nc, "Open NC1"));
     tr.appendChild(makeLinkCell("DRILL", drl, "Open drilling drawing"));
     tr.appendChild(makeLinkCell("PNG", png, "Open thumbnail image"));
 
@@ -1204,8 +1528,6 @@ function renderBomFlatUI() {
   renderNodeMeta({});
   if (treeSectionEl) treeSectionEl.style.display = "block";
 }
-
-
 
 async function tryLoadBom(runId) {
   stopBomPolling();
@@ -1255,7 +1577,6 @@ async function tryLoadBomFlat(runId) {
   bomPollTimer = setInterval(attempt, 1500);
 }
 
-
 // ------------------------------
 // wiring + boot
 // ------------------------------
@@ -1290,7 +1611,7 @@ if (btnGo) {
 
     try {
       currentRunId = await createRun();
-      localStorage.setItem("last_run_id", currentRunId); 
+      localStorage.setItem("last_run_id", currentRunId);
 
       startProgress(currentRunId);
       startStatePolling(currentRunId);
@@ -1340,7 +1661,6 @@ if (bomSearchEl) {
   bomSearchEl.addEventListener("input", () => {
     if (currentView === "bom") renderBomUI();
     if (currentView === "bom_flat") renderBomFlatUI();
-
   });
 }
 

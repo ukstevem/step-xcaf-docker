@@ -101,7 +101,7 @@
       font-size: 12px;
     }
 
-    /* --- New: make viewer less prominent --- */
+    /* --- make viewer less prominent --- */
     #rightPane {
       flex: 0 0 420px;  /* smaller fixed column */
       display: flex;
@@ -122,7 +122,7 @@
       overflow: auto;
     }
 
-      .lnk {
+    .lnk {
       display: inline-block;
       padding: 2px 6px;
       border: 1px solid #cfd6e4;
@@ -142,9 +142,8 @@
       pointer-events: none;
     }
 
-  /* keep link columns narrow */
-  .cell-link { width: 1%; } /* lets the browser shrink these */
-
+    /* keep link columns narrow */
+    .cell-link { width: 1%; } /* lets the browser shrink these */
   </style>
 </head>
 <body>
@@ -222,41 +221,43 @@
   </div>
 
   <div id="treeSection" style="display:none; border-top:1px solid #ddd;">
-  <div id="treeSectionWrap">
-    <div id="treePane">
-      <div class="pvHdr" style="margin-bottom:8px;">
-        <div class="muted" id="treeTitle">Assembly (Grouped)</div>
+    <div id="treeSectionWrap">
+      <div id="treePane">
+        <div class="pvHdr" style="margin-bottom:8px;">
+          <div class="muted" id="treeTitle">Assembly (Grouped)</div>
 
-        <input id="bomSearch" placeholder="Filter…" style="display:none;" />
+          <input id="bomSearch" placeholder="Filter…" style="display:none;" />
 
-        <div style="display:flex; gap:8px; margin-left:auto;">
-          <button id="viewAssembly" class="btn" style="padding:4px 8px; font-size:12px;">Assembly (Grouped)</button>
-          <button id="viewBom" class="btn" style="padding:4px 8px; font-size:12px;">BOM (Global)</button>
-          <button id="btnBomViewer" class="btn btn-sm">Viewer/Explosion BOM</button>
-          <button id="btnBomPurchasing" class="btn btn-sm">Purchasing BOM</button>
+          <div style="display:flex; gap:8px; margin-left:auto;">
+            <button id="viewDash" class="btn" style="padding:4px 8px; font-size:12px;">Dashboard</button>
+            <button id="viewAssembly" class="btn" style="padding:4px 8px; font-size:12px;">Assembly (Grouped)</button>
+            <button id="viewBom" class="btn" style="padding:4px 8px; font-size:12px;">BOM (Global)</button>
+            <button id="btnBomViewer" class="btn btn-sm">Viewer/Explosion BOM</button>
+            <button id="btnBomPurchasing" class="btn btn-sm">Purchasing BOM</button>
+          </div>
+        </div>
 
+        <div class="muted" style="margin-bottom:8px;" id="treeHint">
+          Click a row to load STL
+        </div>
+
+        <div id="tableWrap">
+          <!-- Dashboard cards live here (hidden unless Dashboard view) -->
+          <div id="dash" style="display:none;"></div>
+
+          <!-- Tree / BOM table lives here -->
+          <div id="tree"></div>
         </div>
       </div>
 
-      <div class="muted" style="margin-bottom:8px;" id="treeHint">
-        Click a row to load STL
-      </div>
-
-      <div id="tableWrap">
-        <div id="tree"></div>
-      </div>
-    </div>
-
-    <div id="rightPane">
-      <div id="viewer"></div>
-      <div id="nodeMeta" style="padding:10px 12px; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
+      <div id="rightPane">
+        <div id="viewer"></div>
+        <div id="nodeMeta" style="padding:10px 12px; white-space:pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">
 { }
+        </div>
       </div>
     </div>
   </div>
-</div>
-
-
 
   <script type="module" src="/ui/app.js"></script>
 </body>
